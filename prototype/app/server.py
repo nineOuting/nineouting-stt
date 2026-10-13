@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from engine import Engine, SR, DEFAULT_MODELS  # noqa: E402
+from engine import Engine, SR, DEFAULT_MODELS, line_kind  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 p = argparse.ArgumentParser()
@@ -76,8 +76,9 @@ def publish(ev):
                 ln['text'], ln['conf'] = ln['orig'], ln['orig_conf']; ln.pop('edited', None)
             else:
                 ln['text'], ln['conf'], ln['edited'] = ev['text'], None, ev['source']
+            ln['kind'] = line_kind(ln['text'])   # 고친 텍스트로 맞장구·간투사 다시 판별
             ev = {'type': 'edit', 'id': ev['id'], 'text': ln['text'], 'conf': ln['conf'],
-                  'edited': ln.get('edited'), 'orig': ln['orig']}
+                  'edited': ln.get('edited'), 'orig': ln['orig'], 'kind': ln['kind']}
         else:
             lines[ev['id']] = ev
             if partial and partial['id'] == ev['id']: partial = None
@@ -209,7 +210,7 @@ class H(BaseHTTPRequestHandler):
                 self.send_response(400); self.end_headers(); return
             with lock: manual_seq += 1; i = 1_000_000 + manual_seq   # 엔진 번호와 겹치지 않게
             publish({'type': 'manual', 'id': i, 'start': round(start, 2), 'end': round(start, 2), 'text': text,
-                     'conf': None, 'spk': spk, 'spk_info': None})
+                     'conf': None, 'spk': spk, 'spk_info': None, 'kind': line_kind(text)})
             self.send_response(204); self.end_headers()
         elif self.path == '/edit' and self.headers.get('X-Meetingnote') == 'edit':
             try:
@@ -254,7 +255,7 @@ def main():
             os.makedirs(os.path.dirname(os.path.abspath(A.out)), exist_ok=True)
             with lock, open(A.out, 'w', encoding='utf-8') as f:
                 for ev in sorted(lines.values(), key=lambda e: e['start']):
-                    f.write(json.dumps({k: ev.get(k) for k in ('start', 'end', 'spk', 'spk_info', 'text', 'type', 'conf', 'alts', 'edited', 'orig')},
+                    f.write(json.dumps({k: ev.get(k) for k in ('start', 'end', 'spk', 'spk_info', 'text', 'type', 'kind', 'conf', 'alts', 'edited', 'orig')},
                                        ensure_ascii=False) + '\n')
             print(f'전사문 저장: {A.out}')
         srv.server_close()

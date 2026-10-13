@@ -12,9 +12,10 @@
 
 소리를 feed()로 0.1초씩 넣으면 on_event(dict)가 호출됨 (alt는 작업 스레드에서 호출됨).
   {'type': 'partial',   'id', 'start', 'text'}                          말하는 중 (같은 id가 계속 갱신)
-  {'type': 'final',     'id', 'start', 'end', 'text', 'conf', 'spk', 'spk_info'}   발화 확정. conf는 text 글자별 확신도(0~1)
-  {'type': 'recovered', 'id', 'start', 'end', 'text', 'conf', 'spk', 'spk_info'}   VAD 보완 (시각이 앞선 자리에 끼워야 함)
+  {'type': 'final',     'id', 'start', 'end', 'text', 'conf', 'spk', 'spk_info', 'kind'}   발화 확정. conf는 text 글자별 확신도(0~1)
+  {'type': 'recovered', 'id', 'start', 'end', 'text', 'conf', 'spk', 'spk_info', 'kind'}   VAD 보완 (시각이 앞선 자리에 끼워야 함)
   spk_info: 화자 판단 근거 (Diarizer.assign 참고)
+  kind: 'backchannel'(맞장구) / 'filler'(간투사) / None (line_kind 참고)
   {'type': 'alt',       'id', 'alts': [{'name', 'text'}, ...]}         같은 구간의 다른 인식 결과 (기본과 다른 것만)
 """
 import os, queue, re, threading
@@ -62,6 +63,22 @@ def text_conf(r):
 
 def squash(t):
     return re.sub(r'\s+', '', t)
+
+
+# 맞장구·간투사 구분 (SCRUM-25 8-1절: VAD 보완의 짧은 줄은 대부분 실제 맞장구·간투사라 버리지 않고 표시만 함)
+# 줄 전체가 아래 낱말로만 이뤄졌을 때만 표시. "네 그건 좋은데요"처럼 다른 말이 섞이면 표시하지 않음
+BACKCHANNEL = ['알겠습니다', '그러네요', '맞습니다', '그렇죠', '맞아요', '그쵸', '맞아', '오케이', '네', '예', '응']
+FILLER = ['그러니까', '뭔가', '어', '음', '아', '으', '그', '저', '뭐', '이', '좀']
+_KIND_RE = re.compile('|'.join(sorted(BACKCHANNEL + FILLER, key=len, reverse=True)))
+
+
+def line_kind(text):
+    """'backchannel'(맞장구) / 'filler'(간투사만) / None(일반 발언). 맞장구 낱말이 하나라도 있으면 맞장구."""
+    t = re.sub(r'[\s.,?!~…]', '', text or '')
+    if not t or len(t) > 8: return None
+    words = _KIND_RE.findall(t)
+    if ''.join(words) != t: return None
+    return 'backchannel' if any(w in BACKCHANNEL for w in words) else 'filler'
 
 
 class Diarizer:
@@ -221,7 +238,7 @@ class Engine:
         text, conf = text_conf(r)
         spk, spk_info = self._speaker(cur[0] - 0.2, end + 0.1)  # PoC와 같은 범위: 첫 글자 -0.2초 ~ 마지막 글자 +0.3초
         self.on_event({'type': 'final', 'id': i, 'start': round(cur[0], 2), 'end': round(end, 2),
-                       'text': text, 'conf': conf, 'spk': spk, 'spk_info': spk_info})
+                       'text': text, 'conf': conf, 'spk': spk, 'spk_info': spk_info, 'kind': line_kind(text)})
         if self.alt and any(c < LOW_CONF for c in conf):
             self.alt.submit(i, self._audio(cur[0] - 0.2, end + 0.2), text)
 
@@ -242,7 +259,7 @@ class Engine:
                 self.cover.append((g0, g1))
                 i = self._new_id(); spk, spk_info = self._speaker(g0 - 0.2, g1 + 0.2)
                 self.on_event({'type': 'recovered', 'id': i, 'start': round(g0, 2), 'end': round(g1, 2),
-                               'text': text, 'conf': conf, 'spk': spk, 'spk_info': spk_info})
+                               'text': text, 'conf': conf, 'spk': spk, 'spk_info': spk_info, 'kind': line_kind(text)})
                 if self.alt: self.alt.submit(i, seg, text)
 
     def finish(self):

@@ -94,6 +94,9 @@
   .ebtn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .ebar .hint { font-size: 12px; color: var(--muted); }
   .tag.manual { color: var(--accent); cursor: help; }
+  .tag.kind { color: var(--muted); font-weight: 500; cursor: help; }
+  .ln.minor .txt { color: var(--muted); font-size: .9em; }   /* 맞장구·간투사만 있는 줄: 지우지 않고 흐리게 */
+  body.hide-minor .ln.minor:not(.reveal) { display: none; }   /* 보완 목록에서 이동하면 잠시 보여 줌 */
   .ln.adding { background: var(--rec-bg); }
   .spksel { font: inherit; font-size: 13px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); color: var(--fg); }
   aside li .alts { display: block; font-size: 13px; margin-top: 2px; }
@@ -143,6 +146,8 @@
     참석자 <input type="number" id="maxSp" min="0" max="50" placeholder="자동" inputmode="numeric">명</label>
   <label class="switch" title="화자 칩 옆에 화자 판단 유사도를 표시합니다 (기준 0.60 이상이면 같은 화자). 칩에 마우스를 올리면 근거가 나옵니다">
     <input type="checkbox" id="simSw" checked> 유사도</label>
+  <label class="switch" title="'네네', '그쵸', '어', '그'처럼 맞장구·간투사로만 된 줄을 숨깁니다. 끄면 흐리게 보여 줍니다. 지우는 것이 아니며 저장본에는 남습니다">
+    <input type="checkbox" id="minorSw"> 맞장구 숨기기</label>
   <button class="btn ghost" id="clearBtn" title="지금까지의 전사문을 모두 지웁니다 (되돌릴 수 없음)">지우기</button>
   <button class="btn" id="recBtn" aria-expanded="false" aria-controls="recPanel" disabled>보완 0건</button>
 </header>
@@ -234,6 +239,8 @@ function renderConf(el, text, conf) {
   }
 }
 
+const KIND = { backchannel: '맞장구', filler: '간투사' };
+
 // 다른 결과와 고치기
 // 본문은 chunk-64 · 후보 4. 다른 결과는 모델만 바꾼 것(chunk-16)과 고르는 방식만 바꾼 것(후보 1 = greedy)
 const ALT_NAME = { 'chunk-16': 'chunk-16 · 후보 4', 'chunk-64 greedy': 'chunk-64 · 후보 1' };
@@ -269,6 +276,12 @@ function renderLine(el) {
   }
   if (d.type === 'manual') {
     const tag = el$('span', 'tag manual', '직접 추가'); tag.title = 'STT가 놓친 말을 직접 추가한 줄 (시각은 앞뒤 줄 사이의 근사치)';
+    x.append(tag);
+  }
+  el.classList.toggle('minor', !!d.kind);
+  if (d.kind) {
+    const tag = el$('span', 'tag kind', KIND[d.kind]);
+    tag.title = '맞장구·간투사로만 된 줄 (정해 둔 낱말 목록으로 판별, 흐리게 표시). 위의 "맞장구 숨기기"로 숨길 수 있음';
     x.append(tag);
   }
   if (d.type === 'recovered') {
@@ -379,6 +392,7 @@ function goTo(id) {
   const el = rows.get(id); if (!el) return;
   if (window.matchMedia('(max-width: 760px)').matches) togglePanel(false);
   setFollow(false); jumpUntil = Date.now() + 1200;
+  if (el.classList.contains('minor')) { el.classList.add('reveal'); clearTimeout(el._rv); el._rv = setTimeout(() => el.classList.remove('reveal'), 5000); }
   el.scrollIntoView({ behavior: 'smooth', block: 'center' }); flash(el);
 }
 
@@ -421,7 +435,7 @@ function handle(ev) {
   } else if (ev.type === 'alt' || ev.type === 'edit') {
     if (!el || !el._d) return;
     if (ev.type === 'alt') el._d.alts = ev.alts;
-    else Object.assign(el._d, { text: ev.text, conf: ev.conf, edited: ev.edited, orig: ev.orig });
+    else Object.assign(el._d, { text: ev.text, conf: ev.conf, edited: ev.edited, orig: ev.orig, kind: ev.kind });
     renderLine(el);
     if (recs.has(ev.id)) addRec(el._d);
     if (ev.type === 'edit') flash(el);
@@ -460,6 +474,11 @@ try { simSw.checked = localStorage.getItem('hideSim') !== '1'; } catch (e) {}
 const applySim = () => { document.body.classList.toggle('hide-sim', !simSw.checked);
                          try { localStorage.setItem('hideSim', simSw.checked ? '0' : '1'); } catch (e) {} };
 simSw.onchange = applySim; applySim();
+const minorSw = document.getElementById('minorSw');
+try { minorSw.checked = localStorage.getItem('hideMinor') === '1'; } catch (e) {}
+const applyMinor = () => { document.body.classList.toggle('hide-minor', minorSw.checked);
+                           try { localStorage.setItem('hideMinor', minorSw.checked ? '1' : '0'); } catch (e) {} };
+minorSw.onchange = applyMinor; applyMinor();
 document.getElementById('recClose').onclick = () => togglePanel(false);
 document.addEventListener('keydown', e => { if (e.key === 'Escape') togglePanel(false); });
 
