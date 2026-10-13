@@ -7,10 +7,17 @@ http://localhost:8765 에서 열림. 외부로 보내지 않음. 녹음은 저�
   마이크 장치 목록:  .venv/bin/python app/server.py --list-devices
   마이크로 전사:     .venv/bin/python app/server.py --device 0
   wav로 시험:       .venv/bin/python app/server.py --wav ~/Dev/nineouting-ref/stt_eval/own/eval_own_01.wav
-  전사문 저장:       ... --out transcripts/회의.jsonl   (종료 시 시각순으로 정렬해 다시 씀)
+  전사문 저장:       자동. 세션마다 transcripts/날짜_시각.jsonl 에 줄이 바뀔 때마다 저장 (--save-dir로 폴더, --out으로 첫 세션 파일 지정)
 종료: Ctrl+C (이 프로그램이 띄운 ffmpeg만 종료)
+
+세션 (화면 버튼)
+  서버를 켜면 세션 1이 시작되고 바로 전사함. 녹음은 하지 않음
+  녹음 시작: 지금 세션에 녹음을 붙임 (직전 최대 2분, 세션 시작 이후분 포함). 같은 이름의 .wav
+  일시정지/계속: 전사와 녹음을 같이 멈춤. 멈출 때 무음 2.5초를 넣어 말하던 줄과 보완 판단을 마무리함 (녹음에도 들어감)
+  완료: 세션을 닫고 대기. 닫은 세션의 줄을 고치면 그 파일에 반영됨. 대기에서 녹음 시작 → 화면을 비우고 새 세션 파일
+  시각: 줄의 start·end는 서버 시작 뒤 엔진에 넣은 소리 기준 초 (멈춘 동안은 늘지 않음). wav 안의 시각 = start - wav_t0 (파일 첫 줄 _meta)
 """
-import argparse, json, os, queue, shutil, subprocess, sys, threading, time, wave
+import argparse, datetime, json, os, queue, shutil, subprocess, sys, threading, time, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
@@ -24,7 +31,9 @@ p.add_argument('--wav', default=''); p.add_argument('--port', type=int, default=
 p.add_argument('--models', default=DEFAULT_MODELS, help='stt_models 폴더 (기본: nineouting-ref/stt_models)')
 p.add_argument('--chunk', default='64', choices=['16', '64'])
 p.add_argument('--hotwords', default=''); p.add_argument('--hotwords-score', type=float, default=1.0)
-p.add_argument('--no-recover', action='store_true'); p.add_argument('--out', default='')
+p.add_argument('--no-recover', action='store_true'); p.add_argument('--out', default='', help='첫 세션 전사 파일 경로 (기본: 자동 이름)')
+p.add_argument('--save-dir', default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'transcripts'),
+               help='세션 전사·녹음 파일 폴더 (기본: prototype/transcripts, 깃 제외)')
 p.add_argument('--no-diar', action='store_true', help='화자 번호 표시 끄기')
 p.add_argument('--no-alt', action='store_true', help='다른 인식 결과 끄기 (메모리 약 300MB 절약, 추정)')
 p.add_argument('--max-speakers', type=int, default=0, help='참석자 수 (0이면 자동). 화면에서도 바꿀 수 있음')
@@ -41,7 +50,8 @@ lock = threading.Lock()
 lines = {}          # id → 확정·보완 줄 (새로 접속한 화면에 보냄)
 partial = None      # 지금 말하는 중인 줄
 clients = []        # 화면별 큐
-status = {'source': A.wav or f'마이크 {A.device}', 'audio_sec': 0.0, 'running': True, 'max_speakers': A.max_speakers}
+status = {'source': A.wav or f'마이크 {A.device}', 'audio_sec': 0.0, 'running': True, 'max_speakers': A.max_speakers,
+          'state': 'run', 'rec': False, 'rec_sec': 0.0, 'session': ''}   # state: run(전사 중) / pause(일시정지) / idle(완료 후 대기)
 ENGINE = None       # 화면에서 화자 합치기·참석자 수를 바꿀 때 씀
 manual_seq = 0      # 직접 추가한 줄 번호
 
@@ -83,6 +93,79 @@ def publish(ev):
             lines[ev['id']] = ev
             if partial and partial['id'] == ev['id']: partial = None
         for q in clients: q.put(ev)
+        if ev['type'] not in ('partial', 'status'): save_session()
+
+
+# ---- 세션 (자동 저장·녹음) ----
+SESS = None        # 지금 세션: file, wav_path, wav(쓰는 중인 wave 객체), wav_t0, t0, started, complete
+CTRL = queue.Queue()   # 화면의 녹음·일시정지·완료 요청. 소리 입력 스레드가 소리 조각 사이에 처리함
+
+
+def new_session(t0, path=None):
+    global SESS
+    os.makedirs(A.save_dir, exist_ok=True)
+    base = path or os.path.join(A.save_dir, datetime.datetime.now().strftime('%Y%m%d_%H%M%S') + '.jsonl')
+    os.makedirs(os.path.dirname(os.path.abspath(base)), exist_ok=True)
+    SESS = {'file': base, 'wav_path': None, 'wav': None, 'wav_t0': None, 't0': round(t0, 2),
+            'started': datetime.datetime.now().isoformat(timespec='seconds'), 'complete': False}
+    status['session'] = os.path.basename(base); status['rec'] = False; status['rec_sec'] = 0.0
+
+
+def save_session():
+    """지금 세션의 줄을 파일에 통째로 다시 씀 (lock 안에서 호출). 첫 줄은 _meta"""
+    if not SESS: return
+    meta = {k: SESS[k] for k in ('started', 't0', 'wav_t0', 'complete')}
+    meta.update(source=status['source'], wav=SESS['wav_path'] and os.path.basename(SESS['wav_path']),
+                note='start·end는 서버 시작 뒤 엔진에 넣은 소리 기준 초. wav 안의 시각 = start - wav_t0')
+    tmp = SESS['file'] + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(json.dumps({'_meta': meta}, ensure_ascii=False) + '\n')
+        for ev in sorted(lines.values(), key=lambda e: e['start']):
+            f.write(json.dumps({k: ev.get(k) for k in ('id', 'start', 'end', 'spk', 'spk_info', 'text', 'type', 'kind', 'conf',
+                                                       'alts', 'edited', 'orig', 'orig_conf', 'merged_from')},
+                               ensure_ascii=False) + '\n')
+    os.replace(tmp, SESS['file'])   # 쓰는 도중 꺼져도 이전 파일은 남음
+
+
+def rec_write(c):
+    if SESS and SESS['wav']:
+        SESS['wav'].writeframes((np.clip(c, -1, 1) * 32767).astype(np.int16).tobytes())
+        status['rec_sec'] = round(status['rec_sec'] + len(c) / SR, 1)
+
+
+def rec_close():
+    if SESS and SESS['wav']: SESS['wav'].close(); SESS['wav'] = None
+
+
+def control(eng, act):
+    """소리 입력 스레드에서만 호출. 상태에 맞지 않는 요청은 무시"""
+    st = status['state']
+    def flush():   # 말하던 줄 확정·보완 판단을 위해 무음을 넣음 (녹음에도 같이 넣어 시각을 맞춤)
+        z = np.zeros(1600, np.float32)
+        for _ in range(25): eng.feed(z); rec_write(z)
+        status['audio_sec'] = round(eng.fed, 1)
+    if act == 'record' and st == 'idle':      # 새 세션: 화면을 비우고 새 파일로
+        with lock: new_session(eng.fed)   # 먼저 새 세션으로 바꿔야 아래 clear가 닫은 세션 파일을 비우지 않음
+        publish({'type': 'clear'})
+        st = status['state'] = 'run'
+    if act == 'record' and st in ('run', 'pause') and not SESS['wav']:
+        a0 = max(SESS['t0'], eng.fed - 120); pre = eng._audio(a0, eng.fed) if eng.fed > a0 else np.zeros(0, np.float32)
+        SESS['wav_path'] = os.path.splitext(SESS['file'])[0] + '.wav'
+        w = wave.open(SESS['wav_path'], 'wb'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR)
+        SESS['wav'] = w; SESS['wav_t0'] = round(eng.fed - len(pre) / SR, 2); status['rec'] = True; status['rec_sec'] = 0.0
+        rec_write(pre)
+    elif act == 'pause' and st == 'run':
+        flush(); status['state'] = 'pause'
+    elif act == 'resume' and st == 'pause':
+        status['state'] = 'run'
+    elif act == 'complete' and st in ('run', 'pause'):
+        if st == 'run': flush()
+        rec_close(); status['state'] = 'idle'; status['rec'] = False
+        with lock: SESS['complete'] = True; save_session()
+    else:
+        return
+    with lock: save_session()
+    publish({'type': 'status', **{k: status[k] for k in ('state', 'rec', 'rec_sec', 'session', 'audio_sec')}})
 
 
 # ---- 소리 입력 스레드 ----
@@ -116,8 +199,14 @@ def _audio_loop():
         threading.Thread(target=lambda: ffmpeg_err.extend(l.decode(errors='replace').rstrip() for l in proc.stderr),
                          daemon=True).start()
         read = lambda: proc.stdout.read(3200)
+    with lock: new_session(0.0, A.out or None); save_session()
     t0 = time.perf_counter(); fed = 0.0
     while not stop.is_set():
+        while not CTRL.empty():
+            was = status['state']; control(eng, CTRL.get())
+            if was != 'run' and status['state'] == 'run': t0 = time.perf_counter() - fed   # wav 입력: 실제 속도 기준을 다시 맞춤
+        if A.wav and status['state'] != 'run':   # 파일 입력은 멈춘 동안 읽지 않음 (위치 유지)
+            time.sleep(0.1); continue
         b = read()
         if not b:
             if proc and not stop.is_set():  # 서버가 끄지 않았는데 ffmpeg가 멈춤 → 원인 메시지를 보여줌
@@ -129,7 +218,9 @@ def _audio_loop():
         if A.wav:  # 실제 속도로
             d = fed + len(c) / SR - (time.perf_counter() - t0)
             if d > 0: time.sleep(d)
-        eng.feed(c); fed += len(c) / SR; status['audio_sec'] = round(fed, 1)
+        if status['state'] != 'run':   # 마이크 입력은 멈춘 동안 읽어서 버림
+            continue
+        eng.feed(c); rec_write(c); fed += len(c) / SR; status['audio_sec'] = round(eng.fed, 1)
     eng.finish(); status['running'] = False
     publish({'type': 'status', 'running': False})
 
@@ -198,6 +289,11 @@ class H(BaseHTTPRequestHandler):
             except (ValueError, KeyError, TypeError):
                 self.send_response(400); self.end_headers(); return
             self.send_response(204); self.end_headers()
+        elif self.path == '/control' and self.headers.get('X-Meetingnote') == 'control':
+            d = self._json()
+            if not d or d.get('action') not in ('record', 'pause', 'resume', 'complete'):
+                self.send_response(400); self.end_headers(); return
+            CTRL.put(d['action']); self.send_response(204); self.end_headers()
         elif self.path == '/add' and self.headers.get('X-Meetingnote') == 'add':
             # STT가 아예 못 잡은 말을 사용자가 직접 추가. 시각은 화면이 정한 위치(앞뒤 줄 사이)의 근사치
             global manual_seq
@@ -251,13 +347,10 @@ def main():
                 try: proc.wait(timeout=2)
                 except subprocess.TimeoutExpired: proc.kill()
         th.join(timeout=5)
-        if A.out:
-            os.makedirs(os.path.dirname(os.path.abspath(A.out)), exist_ok=True)
-            with lock, open(A.out, 'w', encoding='utf-8') as f:
-                for ev in sorted(lines.values(), key=lambda e: e['start']):
-                    f.write(json.dumps({k: ev.get(k) for k in ('start', 'end', 'spk', 'spk_info', 'text', 'type', 'kind', 'conf', 'alts', 'edited', 'orig')},
-                                       ensure_ascii=False) + '\n')
-            print(f'전사문 저장: {A.out}')
+        with lock:
+            rec_close()
+            if SESS:
+                save_session(); print(f'전사문 저장: {SESS["file"]}' + (f'  녹음: {SESS["wav_path"]}' if SESS['wav_path'] else ''))
         srv.server_close()
 
 
