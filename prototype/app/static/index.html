@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>회의 실시간 전사</title>
+<style>
+  :root {
+    --bg: #fafaf9; --panel: #ffffff; --fg: #1c1917; --muted: #78716c; --line: #e7e5e4;
+    --partial: #57534e; --accent: #2563eb; --rec-bg: #fef3c7; --rec-tag: #b45309; --ok: #16a34a; --off: #a8a29e;
+    --chip-l: 34%; --chip-bg-l: 93%; --chip-s: 65%;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1917; --panel: #232020; --fg: #f5f5f4; --muted: #a8a29e; --line: #2f2b2a;
+      --partial: #d6d3d1; --accent: #60a5fa; --rec-bg: #422006; --rec-tag: #fbbf24; --ok: #4ade80; --off: #57534e;
+      --chip-l: 78%; --chip-bg-l: 20%; --chip-s: 45%;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
+           padding: 12px 20px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
+  .dot.on { background: var(--ok); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .meta { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; min-width: 0;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .err { color: #dc2626; }
+  .btn { margin-left: auto; font: inherit; font-size: 14px; color: var(--rec-tag); background: transparent;
+         border: 1px solid currentColor; border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+  .btn:disabled { color: var(--off); cursor: default; }
+  .btn.ghost { color: var(--muted); }
+  .btn.ghost + .btn { margin-left: 0; }
+  .btn[aria-expanded="true"] { background: var(--rec-bg); }
+  main { max-width: 860px; margin: 0 auto; padding: 16px 20px 40vh; transition: margin .2s; }
+  body.open main { margin-right: 360px; }
+  .ln { display: grid; grid-template-columns: 56px 1fr; gap: 12px; padding: 6px 8px; border-radius: 6px;
+        transition: background-color 2.5s ease; }
+  .t { color: var(--muted); font-size: 13px; padding-top: 3px; font-variant-numeric: tabular-nums; }
+  .x { word-break: normal; overflow-wrap: anywhere; }  /* 전사문에 띄어쓰기가 없어 keep-all이면 칩 뒤에서 줄이 바뀜 */
+  .ln.partial .txt { color: var(--partial); }
+  .ln.partial .txt::after { content: ""; display: inline-block; width: 2px; height: 1.05em; margin-left: 2px;
+                            vertical-align: -2px; background: var(--accent); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .flash { background: var(--rec-bg) !important; transition: none !important; }
+  .chip { display: inline-block; font-size: 12px; font-weight: 600; border-radius: 4px; padding: 0 6px; margin-right: 6px;
+          vertical-align: 1px; white-space: nowrap;
+          color: hsl(var(--h) var(--chip-s) var(--chip-l)); background: hsl(var(--h) var(--chip-s) var(--chip-bg-l)); }
+  .chip { cursor: pointer; }
+  #maxSp { width: 3.6em; font: inherit; font-size: 13px; padding: 0 4px; border: 1px solid var(--line); border-radius: 4px;
+           background: var(--panel); color: var(--fg); }
+  #mergeMenu { position: absolute; z-index: 5; display: none; background: var(--panel); border: 1px solid var(--line);
+               border-radius: 8px; box-shadow: 0 6px 18px rgba(0,0,0,.15); padding: 6px; font-size: 13px; min-width: 180px; }
+  #mergeMenu.show { display: block; }
+  #mergeMenu .mh { color: var(--muted); font-size: 12px; padding: 2px 6px 6px; }
+  #mergeMenu button { display: block; width: 100%; text-align: left; font: inherit; background: none; border: none;
+                      color: var(--fg); padding: 4px 6px; border-radius: 5px; cursor: pointer; }
+  #mergeMenu button:hover, #mergeMenu button:focus-visible { background: var(--rec-bg); outline: none; }
+  .merged { font-size: 11px; color: var(--muted); margin-left: 4px; }
+  .chip .sim { font-weight: 500; font-variant-numeric: tabular-nums; margin-left: 4px; padding-left: 4px;
+               border-left: 1px solid currentColor; opacity: .85; }
+  .chip .sim.new { text-decoration: underline; }        /* 기준 미만이라 새 화자가 된 발화 */
+  .chip .sim.short { font-style: italic; }              /* 기준 미만이지만 짧아 붙인 발화 */
+  body.hide-sim .chip .sim { display: none; }
+  .tag { display: inline-block; font-size: 11px; font-weight: 600; color: var(--rec-tag); border: 1px solid currentColor;
+         border-radius: 4px; padding: 0 4px; margin-right: 6px; vertical-align: 1px; cursor: pointer; background: none; font-family: inherit; }
+  .low { text-decoration: underline dotted var(--muted); text-decoration-thickness: 1.5px; text-underline-offset: 4px; cursor: help; }
+  body.hide-low .low { text-decoration: none; cursor: auto; }
+  .switch { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
+  .altbtn { font: inherit; font-size: 12px; color: var(--accent); background: none; border: 1px solid currentColor;
+            border-radius: 4px; padding: 0 6px; margin-left: 6px; cursor: pointer; vertical-align: 1px; white-space: nowrap; }
+  .altbtn[aria-expanded="true"] { opacity: .75; }
+  .alts { display: none; margin: 4px 0 2px; padding: 4px 0 4px 10px; border-left: 2px solid var(--line);
+          font-size: 14px; color: var(--muted); }
+  .alts.open { display: block; }
+  .alts .nm { font-size: 11px; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; margin-right: 6px; white-space: nowrap; }
+  .alts .althd { font-size: 11px; margin-bottom: 2px; }
+  .alts .opt { display: block; width: 100%; text-align: left; font: inherit; color: inherit; background: none; border: none;
+               border-radius: 4px; padding: 2px 4px; margin: 1px 0; cursor: pointer; }
+  .alts .opt:hover, .alts .opt:focus-visible { background: var(--rec-bg); color: var(--fg); outline: none; }
+  .edited { display: inline-block; font-size: 11px; color: var(--accent); margin-left: 6px; vertical-align: 1px; cursor: help; }
+  .editbtn { font: inherit; font-size: 13px; color: var(--muted); background: none; border: none; cursor: pointer;
+             padding: 0 4px; margin-left: 4px; opacity: .45; vertical-align: 0; }
+  .ln:hover .editbtn, .editbtn:focus-visible { opacity: 1; }
+  @media (hover: none) { .editbtn { opacity: .8; } }
+  textarea.edit { display: block; width: 100%; margin-top: 4px; font: inherit; color: var(--fg); background: var(--panel);
+                  border: 1px solid var(--accent); border-radius: 6px; padding: 6px 8px; resize: vertical; }
+  .ebar { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+  .ebtn { font: inherit; font-size: 13px; border: 1px solid var(--line); border-radius: 5px; padding: 1px 10px;
+          background: none; color: var(--fg); cursor: pointer; }
+  .ebtn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .ebar .hint { font-size: 12px; color: var(--muted); }
+  .tag.manual { color: var(--accent); cursor: help; }
+  .ln.adding { background: var(--rec-bg); }
+  .spksel { font: inherit; font-size: 13px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); color: var(--fg); }
+  aside li .alts { display: block; font-size: 13px; margin-top: 2px; }
+  .empty { color: var(--muted); text-align: center; padding: 48px 0; }
+  #latest { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 2; display: none;
+            font: inherit; font-size: 14px; color: #fff; background: var(--accent); border: none; border-radius: 999px;
+            padding: 6px 14px; cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,.2); }
+  #latest.show { display: block; }
+  body.open #latest { left: calc(50% - 180px); }
+
+  aside { position: fixed; top: 0; right: 0; bottom: 0; width: 360px; z-index: 3; background: var(--panel);
+          border-left: 1px solid var(--line); transform: translateX(100%); transition: transform .2s;
+          display: flex; flex-direction: column; }
+  body.open aside { transform: none; }
+  aside .hd { display: flex; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line); gap: 8px; }
+  aside h2 { margin: 0; font-size: 15px; }
+  aside .sub { color: var(--muted); font-size: 12px; padding: 8px 16px 0; }
+  aside .close { margin-left: auto; font: inherit; background: none; border: none; color: var(--muted); font-size: 20px;
+                 cursor: pointer; line-height: 1; padding: 4px; }
+  aside ol { list-style: none; margin: 0; padding: 8px; overflow-y: auto; flex: 1; }
+  aside li { padding: 8px; border-radius: 6px; cursor: pointer; display: grid; grid-template-columns: 48px 1fr; gap: 8px; font-size: 15px;
+             transition: background-color 2.5s ease; }
+  aside li:hover, aside li:focus-visible { background: var(--rec-bg); outline: none; }
+  aside li .t { padding-top: 2px; }
+  aside .none { color: var(--muted); font-size: 14px; padding: 16px 8px; }
+
+  @media (max-width: 760px) {
+    body { font-size: 16px; }
+    header { padding: 10px 16px; gap: 8px; }
+    main { padding: 12px 16px 40vh; }
+    body.open main { margin-right: auto; }
+    .ln { grid-template-columns: 46px 1fr; gap: 8px; }
+    aside { top: auto; left: 0; width: auto; height: 55vh; border-left: none; border-top: 1px solid var(--line);
+            transform: translateY(100%); border-radius: 12px 12px 0 0; box-shadow: 0 -8px 24px rgba(0,0,0,.15); }
+    body.open aside { transform: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>회의 실시간 전사</h1>
+  <span class="meta" id="meta">연결 중…</span>
+  <label class="switch" title="모델 확신도가 0.3 미만인 글자에 점선을 긋습니다 (회의 2 기준 표시된 글자 4개 중 1개꼴로 실제 오류)">
+    <input type="checkbox" id="lowSw" checked> 확신 낮은 글자</label>
+  <label class="switch" title="참석자 수를 넣으면 그 인원이 다 찬 뒤로는 새 화자를 만들지 않고 가장 가까운 화자에 붙입니다. 비우면 자동">
+    참석자 <input type="number" id="maxSp" min="0" max="50" placeholder="자동" inputmode="numeric">명</label>
+  <label class="switch" title="화자 칩 옆에 화자 판단 유사도를 표시합니다 (기준 0.60 이상이면 같은 화자). 칩에 마우스를 올리면 근거가 나옵니다">
+    <input type="checkbox" id="simSw" checked> 유사도</label>
+  <button class="btn ghost" id="clearBtn" title="지금까지의 전사문을 모두 지웁니다 (되돌릴 수 없음)">지우기</button>
+  <button class="btn" id="recBtn" aria-expanded="false" aria-controls="recPanel" disabled>보완 0건</button>
+</header>
+<main id="list"><div class="empty" id="empty">말을 시작하면 여기에 전사문이 나타납니다.</div></main>
+<button id="latest">↓ 최신으로</button>
+<div id="mergeMenu" role="menu"></div>
+<aside id="recPanel" aria-label="보완 목록">
+  <div class="hd"><h2>보완 목록</h2><span class="meta" id="recCount"></span>
+    <button class="close" id="recClose" aria-label="닫기">×</button></div>
+  <div class="sub">STT가 놓친 말소리를 VAD로 찾아 다시 인식한 줄. 누르면 본문 위치로 이동합니다.</div>
+  <ol id="recList"><li class="none" id="recNone">아직 없습니다.</li></ol>
+</aside>
+<script>
+const list = document.getElementById('list'), meta = document.getElementById('meta'), dot = document.getElementById('dot');
+const recBtn = document.getElementById('recBtn'), recList = document.getElementById('recList'), recCount = document.getElementById('recCount');
+const rows = new Map();   // id → 본문 줄
+const recs = new Map();   // id → 보완 목록 항목
+let source = '';
+
+const fmt = s => { s = Math.max(0, s); const m = Math.floor(s / 60), r = Math.floor(s % 60).toString().padStart(2, '0');
+                   return `${String(m).padStart(2, '0')}:${r}`; };
+const HUES = [215, 25, 145, 280, 350, 185, 45, 95];
+const nearBottom = () => window.innerHeight + window.scrollY >= document.body.scrollHeight - 160;
+
+// 자동 스크롤: 맨 아래를 보고 있을 때만 새 줄을 따라감. 위로 올리거나 목록에서 이동하면 멈추고 "최신으로" 버튼을 띄움
+const latest = document.getElementById('latest');
+let follow = true, jumpUntil = 0, lastY = window.scrollY;
+function setFollow(f) { follow = f; latest.classList.toggle('show', !f); }
+window.addEventListener('scroll', () => {
+  if (Date.now() < jumpUntil) { lastY = window.scrollY; return; }   // 목록 이동 중의 스크롤은 무시
+  if (window.scrollY < lastY - 4) setFollow(false);                  // 사용자가 위로 올림
+  else if (nearBottom()) setFollow(true);                            // 맨 아래까지 내려옴
+  lastY = window.scrollY;
+});
+latest.onclick = () => { setFollow(true); window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); };
+
+// 화자 칩. info가 있으면 유사도 숫자와 판단 근거(마우스 올리면)를 붙임
+const REASON = {
+  first: i => '첫 발화 → 화자 1',
+  match: i => `화자 ${i.best} 대비 유사도 ${i.sim.toFixed(2)} ≥ 기준 ${i.th.toFixed(2)} → 같은 화자`,
+  short: i => `가장 가까운 화자 ${i.best} 대비 유사도 ${i.sim.toFixed(2)} < 기준 ${i.th.toFixed(2)}이지만, ${i.dur}초로 짧아(${i.min_new}초 미만) 새 화자를 만들지 않고 화자 ${i.best}로`,
+  new: i => `가장 가까운 화자 ${i.best} 대비 유사도 ${i.sim.toFixed(2)} < 기준 ${i.th.toFixed(2)}, ${i.dur}초 발화 → 새 화자`,
+  cap: i => `가장 가까운 화자 ${i.best} 대비 유사도 ${i.sim.toFixed(2)} < 기준 ${i.th.toFixed(2)}이지만, 참석자 ${i.max}명이 다 차서 화자 ${i.best}로`,
+};
+function chip(spk, info) {
+  if (spk == null) return null;
+  const c = document.createElement('span'); c.className = 'chip'; c.textContent = `화자 ${spk}`;
+  c.style.setProperty('--h', HUES[(spk - 1) % HUES.length]);
+  if (info && info.reason) {
+    const all = info.sims.length ? '\n모든 화자와의 유사도: ' + info.sims.map((s, k) => s == null ? null : `화자 ${k + 1} ${s.toFixed(2)}`).filter(Boolean).join(' · ') : '';
+    c.title = (REASON[info.reason] || (() => ''))(info) + all + '\n(누르면 다른 화자로 합칠 수 있음)';
+    const n = document.createElement('span'); n.className = 'sim ' + info.reason;
+    n.textContent = info.reason === 'first' ? '첫' : info.sim.toFixed(2);
+    c.append(n);
+  }
+  return c;
+}
+
+function makeRow(ev) {
+  const el = document.createElement('div'); el.className = 'ln'; el.dataset.start = ev.start; el.id = 'ln' + ev.id;
+  el.innerHTML = '<div class="t"></div><div class="x"><span class="txt"></span></div>';
+  el.querySelector('.t').textContent = fmt(ev.start);
+  el._shown = ''; el._target = '';
+  return el;
+}
+
+// 확정·보완 줄은 시각순 자리에 끼움. 말하는 중인 줄은 항상 맨 아래.
+function place(el) {
+  const start = parseFloat(el.dataset.start);
+  const kids = [...list.querySelectorAll('.ln:not(.partial)')].filter(k => k !== el);
+  const after = kids.find(k => parseFloat(k.dataset.start) > start);
+  if (after) list.insertBefore(el, after);
+  else { const p = list.querySelector('.ln.partial'); p && p !== el ? list.insertBefore(el, p) : list.appendChild(el); }
+}
+
+// 확정 글자: 확신도가 낮은 글자들을 이어서 점선으로 묶음
+const LOW = 0.3;
+function renderConf(el, text, conf) {
+  const t = el.querySelector('.txt'); t.textContent = ''; el._shown = el._target = text;
+  if (!conf || conf.length !== text.length) { t.textContent = text; return; }
+  let i = 0;
+  while (i < text.length) {
+    let j = i; const low = conf[i] < LOW;
+    while (j < text.length && (conf[j] < LOW) === low) j++;
+    if (low) { const s = document.createElement('span'); s.className = 'low'; s.textContent = text.slice(i, j);
+               s.title = `확신도 ${Math.round(Math.min(...conf.slice(i, j)) * 100)}% (낮음)`; t.append(s); }
+    else t.append(text.slice(i, j));
+    i = j;
+  }
+}
+
+// 다른 결과와 고치기
+// 본문은 chunk-64 · 후보 4. 다른 결과는 모델만 바꾼 것(chunk-16)과 고르는 방식만 바꾼 것(후보 1 = greedy)
+const ALT_NAME = { 'chunk-16': 'chunk-16 · 후보 4', 'chunk-64 greedy': 'chunk-64 · 후보 1' };
+const squash = t => (t || '').replace(/\s+/g, '');
+function el$(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+
+// 지금 본문과 다른 선택지: 원래 결과(고친 경우) + 다른 인식 결과
+function options(d) {
+  const seen = new Set([squash(d.text)]), out = [];
+  const add = (label, text) => { if (text && !seen.has(squash(text))) { seen.add(squash(text)); out.push({ label, text }); } };
+  if (d.edited) add('원래 결과 · chunk-64 · 후보 4', d.orig);
+  for (const a of d.alts || []) add(ALT_NAME[a.name] || a.name, a.text);
+  return out;
+}
+
+async function sendEdit(id, text, source) {
+  try {
+    const r = await fetch('/edit', { method: 'POST', headers: { 'X-Meetingnote': 'edit', 'Content-Type': 'application/json' },
+                                     body: JSON.stringify({ id, text, source }) });
+    if (!r.ok) alert(`고치지 못했습니다 (응답 ${r.status}). 서버를 최신 코드로 다시 실행했는지 확인해 주세요.`);
+  } catch (e) { alert('서버에 연결하지 못했습니다.'); }
+}
+
+// 확정·보완 줄 그리기 (상태: el._d). 고치는 중이면 다시 그리지 않음
+function renderLine(el) {
+  if (el._editing) return;
+  const d = el._d, x = el.querySelector('.x'); x.textContent = '';
+  const c = chip(d.spk, d.spk_info);
+  if (c) {
+    c.onclick = e => { e.stopPropagation(); openMerge(c, d.spk); };
+    if (d.merged_from) { c.title = `화자 ${d.merged_from}을(를) 화자 ${d.spk}로 합침\n` + c.title; }
+    x.append(c);
+  }
+  if (d.type === 'manual') {
+    const tag = el$('span', 'tag manual', '직접 추가'); tag.title = 'STT가 놓친 말을 직접 추가한 줄 (시각은 앞뒤 줄 사이의 근사치)';
+    x.append(tag);
+  }
+  if (d.type === 'recovered') {
+    const tag = el$('button', 'tag', '보완'); tag.title = '보완 목록 열기';
+    tag.onclick = () => { togglePanel(true); const li = recs.get(d.id); if (li) { li.scrollIntoView({ block: 'nearest' }); flash(li); } };
+    x.append(tag);
+  }
+  x.append(el$('span', 'txt'));
+  renderConf(el, d.text, d.conf);
+  if (d.edited) { const b = el$('span', 'edited', d.edited === 'alt' ? '후보로 바꿈' : '직접 고침'); b.title = `원래: ${d.orig}`; x.append(b); }
+  const eb = el$('button', 'editbtn', '✎'); eb.title = '직접 고치기'; eb.setAttribute('aria-label', '이 줄 직접 고치기');
+  eb.onclick = () => startEdit(el); x.append(eb);
+  const ab = el$('button', 'editbtn', '＋'); ab.title = '이 줄 다음에 놓친 말 추가'; ab.setAttribute('aria-label', '이 줄 다음에 줄 추가');
+  ab.onclick = () => startAdd(el); x.append(ab);
+  const opts = options(d);
+  if (opts.length) {
+    const open = el._altOpen ?? true;   // 기본은 펼친 상태
+    const b = el$('button', 'altbtn'); b.setAttribute('aria-expanded', open); b.title = '누르면 접고 펼침';
+    b.textContent = `${d.edited ? '다른 선택' : '다른 결과'} ${opts.length} ${open ? '▴' : '▾'}`;
+    const box = el$('div', 'alts' + (open ? ' open' : ''));
+    box.append(el$('div', 'althd', d.edited ? '누르면 그 텍스트로 바뀝니다:' : '본문은 chunk-64 · 후보 4. 다르게 인식한 결과 (누르면 본문을 바꿉니다):'));
+    for (const o of opts) {
+      const ob = el$('button', 'opt'); ob.title = '이 텍스트로 바꾸기';
+      ob.append(el$('span', 'nm', o.label), o.text);
+      ob.onclick = () => sendEdit(d.id, o.text, 'alt'); box.append(ob);
+    }
+    b.onclick = () => { el._altOpen = !(el._altOpen ?? true); renderLine(el); };
+    x.append(b, box);
+  }
+}
+
+// 놓친 말 추가: 이 줄 바로 다음에 입력 줄을 열고, 앞 줄 끝과 다음 줄 시작의 가운데 시각으로 추가
+function startAdd(el) {
+  document.querySelector('.ln.adding')?.remove();
+  setFollow(false);
+  const d = el._d;
+  const next = [...list.querySelectorAll('.ln:not(.partial):not(.adding)')].find(k => parseFloat(k.dataset.start) > d.start && k !== el);
+  const t0 = d.end ?? d.start, t1 = next ? parseFloat(next.dataset.start) : t0 + 1;
+  const start = Math.max(d.start + 0.01, Math.min((t0 + t1) / 2, t1 - 0.01));
+  const row = el$('div', 'ln adding'); row.append(el$('div', 't', fmt(start)));
+  const x = el$('div', 'x');
+  const spkSel = el$('select', 'spksel'); spkSel.setAttribute('aria-label', '화자');
+  spkSel.append(new Option('화자 모름', ''));
+  const spks = [...new Set([...rows.values()].map(r => r._d && r._d.spk).filter(s => s != null))].sort((a, b) => a - b);
+  for (const s of spks) spkSel.append(new Option(`화자 ${s}`, s));
+  const inp = el$('textarea', 'edit'); inp.rows = 2; inp.placeholder = 'STT가 놓친 말을 입력하세요'; inp.setAttribute('aria-label', '추가할 말');
+  const save = el$('button', 'ebtn primary', '추가'), cancel = el$('button', 'ebtn', '취소');
+  const close = () => row.remove();
+  const done = () => {
+    const v = inp.value.replace(/\s*\n\s*/g, ' ').trim(); close();
+    if (v) postJSON('/add', { start, text: v, spk: spkSel.value === '' ? null : Number(spkSel.value) });
+  };
+  inp.onkeydown = e => {
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); done(); }
+    else if (e.key === 'Escape') { e.stopPropagation(); close(); }
+  };
+  save.onclick = done; cancel.onclick = close;
+  const bar = el$('div', 'ebar'); bar.append(spkSel, save, cancel, el$('span', 'hint', 'Enter 추가 · Esc 취소 · 시각은 근사치'));
+  x.append(inp, bar); row.append(x);
+  el.after(row); inp.focus();
+}
+
+// 직접 고치기: Enter 저장 (한글 조합 중 Enter는 무시), Shift+Enter 줄바꿈 없이 무시, Esc 취소
+function startEdit(el) {
+  if (el._editing) return;
+  el._editing = true; setFollow(false);
+  const d = el._d, x = el.querySelector('.x'); x.textContent = '';
+  const c = chip(d.spk, d.spk_info); if (c) x.append(c);
+  const inp = el$('textarea', 'edit'); inp.value = d.text; inp.rows = Math.min(6, Math.ceil(d.text.length / 40) + 1);
+  inp.setAttribute('aria-label', '전사문 고치기');
+  const save = el$('button', 'ebtn primary', '저장'), cancel = el$('button', 'ebtn', '취소');
+  const done = ok => {
+    const v = inp.value.replace(/\s*\n\s*/g, ' ').trim();
+    el._editing = false; renderLine(el);
+    if (ok && v && v !== d.text) sendEdit(d.id, v, 'user');
+  };
+  inp.onkeydown = e => {
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); done(true); }
+    else if (e.key === 'Escape') { e.stopPropagation(); done(false); }
+  };
+  save.onclick = () => done(true); cancel.onclick = () => done(false);
+  const bar = el$('div', 'ebar'); bar.append(save, cancel, el$('span', 'hint', 'Enter 저장 · Esc 취소'));
+  x.append(inp, bar); inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length);
+}
+
+function setText(el, text, animate) {
+  el._target = text;
+  if (!animate || !text.startsWith(el._shown)) { el._shown = text; el.querySelector('.txt').textContent = text; }
+}
+
+// 타이핑: 목표 글자까지 조금씩 늘림 (밀리면 빠르게)
+setInterval(() => {
+  for (const el of list.querySelectorAll('.ln.partial')) {
+    if (el._shown.length < el._target.length) {
+      const step = Math.max(1, Math.ceil((el._target.length - el._shown.length) / 10));
+      el._shown = el._target.slice(0, el._shown.length + step);
+      el.querySelector('.txt').textContent = el._shown;
+    }
+  }
+}, 40);
+
+function flash(el) {
+  el.classList.add('flash'); void el.offsetWidth;
+  setTimeout(() => el.classList.remove('flash'), 60);
+}
+
+function goTo(id) {
+  const el = rows.get(id); if (!el) return;
+  if (window.matchMedia('(max-width: 760px)').matches) togglePanel(false);
+  setFollow(false); jumpUntil = Date.now() + 1200;
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' }); flash(el);
+}
+
+function addRec(ev) {
+  document.getElementById('recNone')?.remove();
+  let li = recs.get(ev.id);
+  if (!li) { li = document.createElement('li'); li.tabIndex = 0; recs.set(ev.id, li);
+             li.onclick = () => goTo(ev.id); li.onkeydown = e => { if (e.key === 'Enter') goTo(ev.id); }; }
+  li.dataset.start = ev.start; li.innerHTML = '<span class="t"></span><span></span>';
+  li.querySelector('.t').textContent = fmt(ev.start);
+  const body = li.lastChild; const c = chip(ev.spk, ev.spk_info); if (c) body.append(c); body.append(ev.text);
+  if (ev.edited) body.append(el$('span', 'edited', ev.edited === 'alt' ? '후보로 바꿈' : '직접 고침'));
+  const opts = options(ev);
+  if (opts.length) { const box = el$('div', 'alts');
+                     for (const o of opts) { const d = el$('div'); d.append(el$('span', 'nm', o.label), o.text); box.append(d); }
+                     body.append(box); }
+  const after = [...recList.children].find(k => parseFloat(k.dataset.start) > ev.start);
+  after ? recList.insertBefore(li, after) : recList.appendChild(li);
+  recBtn.disabled = false; recBtn.textContent = `보완 ${recs.size}건`; recCount.textContent = `${recs.size}건`;
+}
+
+function handle(ev) {
+  document.getElementById('empty')?.remove();
+  let el = rows.get(ev.id);
+  if (ev.type === 'partial') {
+    if (!el) { el = makeRow(ev); el.classList.add('partial'); rows.set(ev.id, el); list.appendChild(el); }
+    setText(el, ev.text, true);
+  } else if (ev.type === 'final' || ev.type === 'recovered' || ev.type === 'manual') {
+    if (!el) { el = makeRow(ev); rows.set(ev.id, el); }
+    el.classList.remove('partial'); el.dataset.start = ev.start;
+    el.querySelector('.t').textContent = fmt(ev.start);
+    el._d = { ...ev };
+    renderLine(el); place(el);
+    if (ev.type === 'recovered') { addRec(el._d); flash(el); }
+  } else if (ev.type === 'merge') {   // 화자 src → dst: 해당 줄 번호를 모두 바꿈
+    for (const r of rows.values()) {
+      if (r._d && r._d.spk === ev.src) { r._d.spk = ev.dst; r._d.merged_from = ev.src; renderLine(r); if (recs.has(r._d.id)) addRec(r._d); }
+    }
+    return;
+  } else if (ev.type === 'alt' || ev.type === 'edit') {
+    if (!el || !el._d) return;
+    if (ev.type === 'alt') el._d.alts = ev.alts;
+    else Object.assign(el._d, { text: ev.text, conf: ev.conf, edited: ev.edited, orig: ev.orig });
+    renderLine(el);
+    if (recs.has(ev.id)) addRec(el._d);
+    if (ev.type === 'edit') flash(el);
+    return;   // 고치기·다른 결과는 스크롤을 움직이지 않음
+  }
+  if (follow) { jumpUntil = Date.now() + 100; window.scrollTo(0, document.body.scrollHeight); }
+}
+
+function togglePanel(open) {
+  open = open ?? !document.body.classList.contains('open');
+  document.body.classList.toggle('open', open); recBtn.setAttribute('aria-expanded', open);
+}
+recBtn.onclick = () => togglePanel();
+
+// 전사문 지우기: 서버 기록까지 지움 (같은 주소를 연 다른 화면도 비워짐). 인식은 계속됨
+document.getElementById('clearBtn').onclick = async () => {
+  if (!confirm('지금까지의 전사문을 모두 지울까요?\n\n· 되돌릴 수 없습니다\n· 같은 주소를 연 다른 화면도 비워집니다\n· --out으로 저장 중이면 지운 뒤의 내용만 저장됩니다\n· 인식은 계속되며, 지금부터 하는 말이 다시 쌓입니다')) return;
+  try {
+    const r = await fetch('/clear', { method: 'POST', headers: { 'X-Meetingnote': 'clear' } });
+    if (!r.ok) alert(`지우지 못했습니다 (응답 ${r.status}). 서버를 최신 코드로 다시 실행했는지 확인해 주세요.`);
+  } catch (e) { alert('서버에 연결하지 못했습니다.'); }
+};
+function clearAll() {
+  rows.clear(); recs.clear();
+  list.innerHTML = '<div class="empty" id="empty">말을 시작하면 여기에 전사문이 나타납니다.</div>';
+  recList.innerHTML = '<li class="none" id="recNone">아직 없습니다.</li>';
+  recBtn.disabled = true; recBtn.textContent = '보완 0건'; recCount.textContent = ''; togglePanel(false); setFollow(true);
+}
+const lowSw = document.getElementById('lowSw');
+try { lowSw.checked = localStorage.getItem('hideLow') !== '1'; } catch (e) {}
+const applyLow = () => { document.body.classList.toggle('hide-low', !lowSw.checked);
+                         try { localStorage.setItem('hideLow', lowSw.checked ? '0' : '1'); } catch (e) {} };
+lowSw.onchange = applyLow; applyLow();
+const simSw = document.getElementById('simSw');
+try { simSw.checked = localStorage.getItem('hideSim') !== '1'; } catch (e) {}
+const applySim = () => { document.body.classList.toggle('hide-sim', !simSw.checked);
+                         try { localStorage.setItem('hideSim', simSw.checked ? '0' : '1'); } catch (e) {} };
+simSw.onchange = applySim; applySim();
+document.getElementById('recClose').onclick = () => togglePanel(false);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') togglePanel(false); });
+
+// 화자 합치기 메뉴: 칩을 누르면 지금 화면에 있는 다른 화자 목록을 보여줌
+const mergeMenu = document.getElementById('mergeMenu');
+function openMerge(chipEl, spk) {
+  const others = [...new Set([...rows.values()].map(r => r._d && r._d.spk).filter(s => s != null && s !== spk))].sort((a, b) => a - b);
+  mergeMenu.textContent = '';
+  mergeMenu.append(el$('div', 'mh', others.length ? `화자 ${spk}의 모든 줄을 합칠 대상 (되돌릴 수 없음)` : '합칠 다른 화자가 없습니다'));
+  for (const o of others) {
+    const b = el$('button', null, `화자 ${o}에 합치기`); b.setAttribute('role', 'menuitem');
+    b.onclick = () => { closeMerge(); postJSON('/merge', { src: spk, dst: o }); };
+    mergeMenu.append(b);
+  }
+  const r = chipEl.getBoundingClientRect();
+  mergeMenu.style.left = Math.min(window.scrollX + r.left, window.scrollX + innerWidth - 200) + 'px';
+  mergeMenu.style.top = (window.scrollY + r.bottom + 4) + 'px';
+  mergeMenu.classList.add('show'); mergeMenu.querySelector('button')?.focus();
+}
+function closeMerge() { mergeMenu.classList.remove('show'); }
+document.addEventListener('click', e => { if (!mergeMenu.contains(e.target)) closeMerge(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMerge(); });
+
+async function postJSON(path, body) {
+  try {
+    const r = await fetch(path, { method: 'POST', headers: { 'X-Meetingnote': path.slice(1), 'Content-Type': 'application/json' },
+                                  body: JSON.stringify(body) });
+    if (!r.ok) alert(`처리하지 못했습니다 (응답 ${r.status}). 서버를 최신 코드로 다시 실행했는지 확인해 주세요.`);
+  } catch (e) { alert('서버에 연결하지 못했습니다.'); }
+}
+
+// 참석자 수: 바꾸면 바로 서버에 반영 (비우면 자동)
+const maxSp = document.getElementById('maxSp');
+maxSp.onchange = () => { const n = parseInt(maxSp.value, 10); postJSON('/speakers', { max: Number.isFinite(n) && n > 0 ? n : 0 }); };
+
+function showStatus(st) {
+  if ('max_speakers' in st && document.activeElement !== maxSp) maxSp.value = st.max_speakers ? st.max_speakers : '';
+  if (st.source) source = st.source;
+  dot.classList.toggle('on', st.running !== false);
+  const t = st.audio_sec != null ? ` · ${fmt(st.audio_sec)}` : '';
+  meta.className = 'meta' + (st.error ? ' err' : '');
+  meta.textContent = st.error ? `오류: ${st.error}` : `${source}${t}${st.running === false ? ' · 종료됨' : ''}`;
+}
+
+const es = new EventSource('/events');
+es.addEventListener('hello', e => showStatus(JSON.parse(e.data)));
+es.addEventListener('tick', e => showStatus(JSON.parse(e.data)));
+es.onmessage = e => { const ev = JSON.parse(e.data);
+                      ev.type === 'status' ? showStatus(ev) : ev.type === 'clear' ? clearAll() : handle(ev); };
+es.onerror = () => { dot.classList.remove('on'); meta.textContent = '서버 연결 끊김 (서버를 다시 실행하면 새로고침)'; };
+</script>
+</body>
+</html>

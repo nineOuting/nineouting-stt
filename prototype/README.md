@@ -1,0 +1,84 @@
+# prototype — 회의 실시간 전사 웹 프로토타입
+
+회의 실시간 전사 웹 화면 (로컬 실행). 마이크 소리를 받아 브라우저에 전사문을 실시간으로 보여줌.
+
+- 말하는 중의 글자가 타이핑되듯 나타나고, 발화가 끝나면 확정됨
+- 스트리밍 STT가 놓친 말(화자가 틈 없이 바뀔 때의 대답 등)을 VAD로 찾아 다시 인식하고, 시각에 맞는 자리에 "보완" 표시와 함께 끼워 넣음
+- 상단 "보완 N건" 버튼으로 보완된 줄만 모아 보고, 누르면 본문 위치로 이동
+- 확정 줄마다 화자 번호 표시 ("화자 1" 등, 이름은 모름). 칩 옆 숫자는 판단 때의 유사도 (기준 0.60 이상이면 같은 화자, 밑줄=새 화자가 됨, 기울임=짧아서 가장 가까운 화자에 붙임). 칩에 마우스를 올리면 근거와 모든 화자와의 유사도가 나옴. 상단 "유사도" 스위치로 숫자 끄기
+- 화자가 너무 많이 나뉠 때: 상단 "참석자 N명"을 넣으면 그 인원이 다 찬 뒤로는 새 화자를 만들지 않고 가장 가까운 화자에 붙임 (`--max-speakers N`으로 시작 시 지정 가능). 이미 생긴 화자는 줄이지 않음. 화자 칩을 누르면 다른 화자에 합칠 수 있음 (지난 줄 번호도 바뀌고 이후 판단에도 반영, 되돌릴 수 없음)
+- 모델 확신도가 0.3 미만인 글자에 점선 표시 (상단 스위치로 끄기). 회의 2 정답 기준 표시된 글자 중 약 27%가 실제 오류, 오류의 약 24%가 표시됨 (nineouting-ref/stt_eval/meeting2/confidence_check.py)
+- 보완 줄 전부와 확신도 낮은 글자가 있는 줄은 chunk-16·chunk-64 greedy로 다시 인식해, 결과가 다르면 "다른 결과" 버튼으로 보여줌 (진짜 2등 후보가 아님. sherpa-onnx 1.13.8에서 후보 목록을 꺼내는 방법은 찾지 못함)
+- "다른 결과" 항목을 누르면 본문이 그 텍스트로 바뀜. 줄 끝 ✎로 직접 고칠 수 있음 (Enter 저장, Esc 취소). 고친 줄에는 "후보로 바꿈"/"직접 고침" 표시, 원래 결과는 선택지로 남아 되돌릴 수 있음. 고친 내용은 서버 기록과 `--out` 저장에 반영됨
+- STT가 아예 못 잡은 말은 줄 끝 ＋로 그 줄 다음에 직접 추가 (화자 선택 가능, "직접 추가" 표시). 시각은 앞 줄 끝과 다음 줄 시작의 가운데로 잡은 근사치
+- 상단 "지우기"로 지금까지의 전사문을 지움 (서버 기록까지, 같은 주소를 연 다른 화면도 비워짐). 인식은 계속되고, 지운 시각보다 앞에서 시작한 줄(말하던 중이던 줄, 판단 대기 중이던 보완)은 나중에 도착해도 버림
+- `localhost`에서만 열림. 회의 내용을 외부로 보내지 않음. 녹음은 저장하지 않음 (다시 인식용으로 최근 120초만 메모리에 둠)
+
+## 실행
+
+```bash
+cd ~/Dev/nineouting-stt/prototype
+.venv/bin/python app/server.py --list-devices      # 마이크 장치 번호 확인
+.venv/bin/python app/server.py --device 0          # 마이크로 전사 → http://localhost:8765
+```
+
+| 옵션 | 내용 |
+|---|---|
+| `--device N` | 마이크 장치 번호 (avfoundation) |
+| `--wav 파일` | 마이크 대신 wav(16kHz 모노 16bit)를 실제 속도로 입력 (시험용) |
+| `--out 파일.jsonl` | 종료 시 전사문을 시각순으로 저장 |
+| `--hotwords 파일 --hotwords-score 1.0` | 핫워드 (회의 용어). 흔한 말로 시작하는 단어는 넣지 않음 |
+| `--chunk 16` | 글자가 더 자주 나옴(약 0.3초 단위) 대신 정확도 낮음. 기본 64 |
+| `--no-recover` | VAD 보완 끄기 |
+| `--no-diar` | 화자 번호 끄기 |
+| `--max-speakers N` | 참석자 수 (0이면 자동). 화면에서도 바꿀 수 있음 |
+| `--no-alt` | 다른 인식 결과 끄기 (인식기 2개를 덜 올림, 메모리 약 300MB 절약 추정) |
+| `--models 경로` | 모델 폴더. 기본 `~/Dev/nineouting-ref/stt_models` |
+| `--port N` | 기본 8765 |
+
+- 종료: Ctrl+C
+- 처음 마이크로 실행하면 macOS가 터미널 앱의 마이크 접근 허용을 물을 수 있음 (시스템 설정 → 개인정보 보호 및 보안 → 마이크)
+- 마이크 입력은 PATH의 ffmpeg(avfoundation)를 씀
+
+## 설치
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install --only-binary=:all: -r requirements.txt
+```
+
+모델은 복사하지 않고 nineouting-ref의 것을 씀.
+
+STT 모델 출처: [kangkyu/icefall-asr-ko-streaming-zipformer-174m](https://huggingface.co/kangkyu/icefall-asr-ko-streaming-zipformer-174m) (Hugging Face, Apache 2.0)
+- 우리 파일 7개(encoder·decoder·joiner chunk-16/64, tokens.txt)의 SHA256이 배포처 SHA256SUMS와 일치함 (2026-10-13 확인)
+- 학습 데이터 약 6,500시간 (KsponSpeech 964시간 + AI Hub 약 5,500시간). AI Hub 데이터 이용 조건은 별도 확인 필요
+- 학습용 원본 체크포인트 `epoch-99.pt`(623MB)와 chunk-32 ONNX도 배포됨 (우리는 받지 않음). 학습 레시피는 icefall `egs/librispeech/ASR/zipformer`
+- 모델 카드 CER (KsponSpeech 평가, 작성자 측정): chunk-64 7.53%, chunk-32 7.82%, chunk-16 8.26%
+- STT: `stt_models/zipformer-174m/*-chunk-64-left-128.int8.onnx`, `tokens.txt`
+- VAD: `stt_models/speaker/silero_vad.onnx`
+- 화자: `stt_models/speaker/nemo_en_titanet_small.onnx`
+
+## 구조
+
+| 파일 | 내용 |
+|---|---|
+| `app/engine.py` | 메인 스트리밍 STT + VAD 보완. 소리를 넣으면 partial / final / recovered 이벤트를 냄 |
+| `app/server.py` | 소리 입력(마이크·wav) 스레드, 로컬 웹 서버, SSE로 이벤트 전송 |
+| `app/static/index.html` | 화면. 타이핑 표시, 보완 줄 제자리 끼우기, 자동 스크롤 |
+
+## 설정 근거
+
+nineouting-ref/stt_eval/meeting2/ 의 실험 문서
+- `stt_improve.md` (SCRUM-23): chunk-64, 후보 4, 핫워드 21개·가산점 1.0 추천
+- `scrum25_vad_recover.md` (SCRUM-25): VAD 보완. 회의 1 평가 구간 CER 26.5% → 20.8%, 삭제 162 → 76자 / 회의 2 4.9% → 5.1%, 삭제 53 → 32자 (실시간 동작, 기다림 2.0초). 보완 텍스트는 말소리 끝 약 2초 뒤에 붙음
+
+- 화자 번호: TitaNet-small 임베딩을 발화마다 누적 비교 (`stt_eval/poc/summary.md` 4절). 설정 E = 유사도 0.60, 2초 미만 발화는 새 화자로 등록하지 않음. PoC 두 구간 DER 평균 8.2% (chunk-16 확정 발화 기준이라 chunk-64에서는 미검증)
+
+## 확인한 것과 안 한 것
+
+- wav(회의 1 평가 구간)를 실제 속도로 넣어 화면 동작 확인함 (2026-10-13): 타이핑, 확정, 보완 줄 제자리 끼우기, 콘솔 오류 없음
+- 실제 마이크 입력은 확인하지 않음. miniconda ffmpeg의 avfoundation 지원도 확인하지 않음
+- 화자 번호·보완 목록 패널·"최신으로" 버튼·휴대폰 폭(375px) 화면을 wav로 확인함 (2026-10-13). 화자 번호의 정확도는 재지 않음
+- 짧은 대답(2초 미만)은 새 사람이어도 기존 화자 중 가장 가까운 사람으로 붙음 (설정 E의 부작용)
+- 한 줄 안에서 화자가 바뀌면 한 사람으로 처리됨
+- 보완 줄과 이웃 줄의 경계에서 한 단어가 겹칠 수 있음 (보완 구간 앞뒤 0.2초 여유 때문)
