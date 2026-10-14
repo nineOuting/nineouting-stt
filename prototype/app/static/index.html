@@ -21,7 +21,7 @@
   body { margin: 0; background: var(--bg); color: var(--fg);
          font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
   header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
-           padding: 12px 20px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+           padding: 12px calc(20px + var(--cut-r, 0px)) 12px calc(20px + var(--cut-l, 0px)); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   h1 { font-size: 17px; margin: 0; font-weight: 600; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
   .dot.on { background: var(--ok); animation: pulse 1.6s infinite; }
@@ -35,7 +35,16 @@
   .btn.ghost { color: var(--muted); }
   .btn.ghost + .btn { margin-left: 0; }
   .btn[aria-expanded="true"] { background: var(--rec-bg); }
-  .ctls { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+  /* 보기 설정: 스위치·참석자 입력을 접어 상단 바를 한 줄(약 950px)로 줄임 */
+  .viewopts { position: relative; flex: none; }
+  .viewopts summary { list-style: none; margin-left: 0; user-select: none; display: inline-block; white-space: nowrap; }
+  .viewopts summary::-webkit-details-marker { display: none; }
+  .viewopts[open] summary { background: var(--rec-bg); }
+  .vmenu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 6; display: flex; flex-direction: column; gap: 10px;
+           background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
+           box-shadow: 0 6px 18px rgba(0,0,0,.15); white-space: nowrap; }
+  .vmenu .switch { font-size: 14px; color: var(--fg); }
+  .ctls { display: flex; align-items: center; gap: 6px; margin-left: 8px; }   /* 오른쪽 끝에 붙이지 않음: 창이 모니터보다 넓어도 버튼이 보이게 */
   .ctls .btn { margin-left: 0; }
   .ctls + .btn { margin-left: 0; }
   .btn.recst { color: var(--recred); }
@@ -44,7 +53,7 @@
   .recind.on::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--recred); animation: pulse 1.2s infinite; }
   .recind.pause { color: var(--rec-tag); }
   main { max-width: 860px; margin: 0 auto; padding: 16px 20px 40vh; transition: margin .2s; }
-  body.open main { margin-right: 360px; }
+  body.open main { margin-right: calc(360px + var(--cut-r, 0px)); }
   .ln { display: grid; grid-template-columns: 56px 1fr; gap: 12px; padding: 6px 8px; border-radius: 6px;
         transition: background-color 2.5s ease; }
   .t { color: var(--muted); font-size: 13px; padding-top: 3px; font-variant-numeric: tabular-nums; }
@@ -150,8 +159,8 @@
   #latest.show { display: block; }
   body.open #latest { left: calc(50% - 180px); }
 
-  aside { position: fixed; top: 0; right: 0; bottom: 0; width: 360px; z-index: 3; background: var(--panel);
-          border-left: 1px solid var(--line); transform: translateX(100%); transition: transform .2s;
+  aside { position: fixed; top: var(--hdr-h, 0px);   /* 상단 바 아래에서 시작해 버튼을 가리지 않음 */ right: var(--cut-r, 0px);   /* 창이 모니터 밖으로 나간 만큼 안쪽으로 */ bottom: 0; width: 360px; z-index: 3; background: var(--panel);
+          border-left: 1px solid var(--line); transform: translateX(calc(100% + var(--cut-r, 0px)));   /* 닫힌 패널은 당긴 만큼 더 밀어 완전히 숨김 */ transition: transform .2s;
           display: flex; flex-direction: column; }
   aside.show { transform: none; }
   aside .hd { display: flex; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line); gap: 8px; }
@@ -183,6 +192,9 @@
   <span class="dot" id="dot"></span>
   <h1>회의 실시간 전사</h1>
   <span class="meta" id="meta">연결 중…</span>
+  <details class="viewopts" id="viewOpts">
+  <summary class="btn ghost" title="화면 표시 설정">보기 설정 ▾</summary>
+  <div class="vmenu">
   <label class="switch" title="모델 확신도가 0.3 미만인 글자에 점선을 긋습니다 (회의 2 기준 표시된 글자 4개 중 1개꼴로 실제 오류)">
     <input type="checkbox" id="lowSw" checked> 확신 낮은 글자</label>
   <label class="switch" title="참석자 수를 넣으면 그 인원이 다 찬 뒤로는 새 화자를 만들지 않고 가장 가까운 화자에 붙입니다. 비우면 자동">
@@ -191,6 +203,8 @@
     <input type="checkbox" id="simSw" checked> 유사도</label>
   <label class="switch" title="'네네', '그쵸', '어', '그'처럼 맞장구·간투사로만 된 줄을 숨깁니다. 끄면 흐리게 보여 줍니다. 지우는 것이 아니며 저장본에는 남습니다">
     <input type="checkbox" id="minorSw"> 맞장구 숨기기</label>
+  </div>
+  </details>
   <div class="ctls">
     <span class="recind" id="recInd" aria-live="polite"></span>
     <button class="btn recst" id="recStart" hidden>● 녹음 시작</button>
@@ -517,7 +531,28 @@ function handle(ev) {
   if (follow) { jumpUntil = Date.now() + 100; window.scrollTo(0, document.body.scrollHeight); }
 }
 
-// 오른쪽 패널: 보완 목록(rec)과 요약 전송(send) 중 하나만 열림
+// 창이 모니터 밖으로 나가 있으면 그만큼(--cut-l, --cut-r) 상단 바와 오른쪽 패널을 안쪽으로 당김.
+// 창을 옮기면 이벤트가 없어 1초마다 다시 잼. 창이 모니터 안에 다 있으면 둘 다 0
+function fitScreen() {
+  const sl = screen.availLeft ?? 0, sw = screen.availWidth, border = Math.max(0, (outerWidth - innerWidth) / 2);
+  const left = screenX + border;                           // 페이지 왼쪽 끝의 모니터 좌표
+  const cutL = Math.max(0, Math.round(sl - left));
+  const cutR = Math.max(0, Math.round(left + innerWidth - (sl + sw)));
+  const r = document.documentElement.style;
+  if (r.getPropertyValue('--cut-l') !== cutL + 'px') r.setProperty('--cut-l', cutL + 'px');
+  if (r.getPropertyValue('--cut-r') !== cutR + 'px') r.setProperty('--cut-r', cutR + 'px');
+  return [cutL, cutR];
+}
+fitScreen(); setInterval(fitScreen, 1000); addEventListener('resize', fitScreen);
+
+// 보기 설정: 바깥을 누르거나 Esc면 닫음
+const viewOpts = document.getElementById('viewOpts');
+document.addEventListener('click', e => { if (viewOpts.open && !viewOpts.contains(e.target)) viewOpts.open = false; });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') viewOpts.open = false; });
+
+// 오른쪽 패널: 보완 목록(rec)과 요약 전송(send) 중 하나만 열림. 상단 바 높이만큼 내려서 염 (화면 폭에 따라 바가 두 줄이 됨)
+const hdr = document.querySelector('header');
+new ResizeObserver(() => document.documentElement.style.setProperty('--hdr-h', hdr.offsetHeight + 'px')).observe(hdr);
 const recPanel = document.getElementById('recPanel'), sendPanel = document.getElementById('sendPanel'), sendBtn = document.getElementById('sendBtn');
 let panel = null;
 function setPanel(name) {

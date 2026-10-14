@@ -21,7 +21,7 @@ http://localhost:8765 에서 열림. 외부로 보내지 않음. 녹음은 저�
   세션 = 회의. 세션마다 meeting_id를 붙이고, 확정 줄을 --send-period초(기본 10)마다 묶어 보냄. 시작·멈춤·재개·끝 알림은 바로 보냄
   --summary-url이 없으면 세션 파일 옆 <이름>.outbox.jsonl 에만 기록
 """
-import argparse, datetime, json, os, queue, shutil, subprocess, sys, threading, time, wave
+import argparse, datetime, json, os, queue, shutil, signal, subprocess, sys, threading, time, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
@@ -42,6 +42,8 @@ p.add_argument('--save-dir', default=os.path.join(os.path.dirname(os.path.dirnam
 p.add_argument('--no-diar', action='store_true', help='화자 번호 표시 끄기')
 p.add_argument('--no-alt', action='store_true', help='다른 인식 결과 끄기 (메모리 약 300MB 절약, 추정)')
 p.add_argument('--max-speakers', type=int, default=0, help='참석자 수 (0이면 자동). 화면에서도 바꿀 수 있음')
+p.add_argument('--max-len', type=float, default=10.0, help='한 줄 최대 길이(초). 쉼 없이 길게 말하면 이 길이에서 끊음 (이전 20)')
+p.add_argument('--overlap', type=float, default=1.0, help='최대 길이로 끊을 때 직전 소리를 새 줄에 다시 넣는 길이(초). 걸친 단어를 살리는 대신 앞뒤 줄에 겹칠 수 있음. 0이면 끔')
 p.add_argument('--summary-url', default='', help='요약 쪽 받는 주소 (예: http://localhost:8000/stt). 없으면 outbox 파일에만 기록')
 p.add_argument('--send-period', type=float, default=10.0, help='요약 쪽 전송 주기(초)')
 p.add_argument('--meeting-id', default='', help='첫 회의의 meeting_id (앱이 줄 값. 없으면 자동)')
@@ -66,14 +68,16 @@ SENDER = Sender(A.summary_url, A.send_period, now=lambda: ENGINE.fed if ENGINE e
                 log=lambda m: print(m, file=sys.stderr, flush=True), on_update=lambda ev: publish(ev))
 
 
-clear_at = -1.0     # 마지막으로 지운 오디오 시각. 이보다 앞에서 시작한 줄은 나중에 도착해도 버림
+clear_at = -1.0     # 마지막으로 지운 오디오 시각. 이보다 앞에서 시작한 보완 줄은 나중에 도착해도 버림
+clear_id = 0        # 지울 때의 엔진 줄 번호. 이 번호 이하의 말하던·확정 줄은 지우기 전 줄이라 버림
+                    # (인식기는 글자로 안 바꾼 소리를 약 1.2초 들고 있어서, 지운 뒤 새 줄의 시작 시각이 지운 시각보다 조금 앞설 수 있음 → 시각으로 거르면 지운 뒤 말까지 버려짐)
 
 
 def publish(ev):
-    global partial, clear_at
+    global partial, clear_at, clear_id
     with lock:
-        if ev['type'] in ('partial', 'final', 'recovered') and ev['start'] < clear_at:
-            return   # 지우기 전에 시작한 줄 (말하던 중이던 줄, 판단 대기 중이던 보완)
+        if (ev['type'] in ('partial', 'final') and ev['id'] <= clear_id) or (ev['type'] == 'recovered' and ev['start'] < clear_at):
+            return   # 지우기 전 줄 (말하던 중이던 줄, 판단 대기 중이던 보완)
         if ev['type'] == 'partial':
             partial = ev
         elif ev['type'] in ('send', 'send_pending'):   # 요약 전송 상태창. 보낸 줄·수정에 묶음 번호를 붙여 둠 (새로 접속한 화면용)
@@ -93,7 +97,8 @@ def publish(ev):
             if not ev.get('session_switch'):   # 같은 회의 안에서 지우면 요약 쪽에도 삭제로 알림 (새 회의로 넘어갈 때는 알리지 않음)
                 for ln in lines.values():
                     if not ln.get('deleted'): SENDER.edit(ln['id'], ln.get('rev', 0) + 1, deleted=True)
-            lines.clear(); partial = None; clear_at = status['audio_sec']
+            lines.clear(); partial = None; clear_at = status['audio_sec']; clear_id = ENGINE.next_id if ENGINE else 0
+            if ENGINE: ENGINE.restart = True   # 지운 뒤에 한 말이 지우기 전 줄에 이어 붙어 버려지지 않게
         elif ev['type'] == 'merge':  # 화자 src를 dst로 합침: 지난 줄 번호를 모두 바꿈
             for ln in lines.values():
                 if ln.get('spk') == ev['src']:
@@ -218,7 +223,8 @@ def _audio_loop():
     global proc, ENGINE
     eng = ENGINE = Engine(publish, max_speakers=A.max_speakers, model_dir=f'{A.models}/zipformer-174m', vad_model=f'{A.models}/speaker/silero_vad.onnx',
                  chunk=A.chunk, hotwords=A.hotwords, hotwords_score=A.hotwords_score, recover=not A.no_recover,
-                 spk_model=f'{A.models}/speaker/nemo_en_titanet_small.onnx', diar=not A.no_diar, alt=not A.no_alt)
+                 spk_model=f'{A.models}/speaker/nemo_en_titanet_small.onnx', diar=not A.no_diar, alt=not A.no_alt,
+                 max_len=A.max_len, overlap=A.overlap)
     if A.wav:
         w = wave.open(A.wav); assert w.getframerate() == SR and w.getnchannels() == 1 and w.getsampwidth() == 2
         read = lambda: w.readframes(1600)
@@ -377,6 +383,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # 정리(마이크 끄기·저장)는 최대 약 10초. 그 사이 Ctrl+C를 또 누르면 저장이 끊기므로 무시함 (강제 종료는 Ctrl+\)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        print('\n끄는 중… 녹음·전사 파일을 저장하고 있으니 잠시 기다려 주세요 (최대 약 10초)', flush=True)
         stop.set()
         if proc and proc.poll() is None:  # 이 프로그램이 띄운 ffmpeg만 종료: 먼저 정상 종료('q'), 안 되면 신호
             try:

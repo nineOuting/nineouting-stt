@@ -2,6 +2,8 @@
 
 설정 근거는 nineouting-ref/stt_eval/meeting2/stt_improve.md (SCRUM-23)와 scrum25_vad_recover.md (SCRUM-25).
 - STT: zipformer-174m chunk-64, modified_beam_search, 후보 4, 발화 끊기 2.4/0.8/20초
+  (end_silence=말한 뒤 쉼, max_len=최대 길이. 최대 길이로 강제로 끊을 때는 걸쳐 있던 단어를 잃음 →
+   overlap초만큼 직전 소리를 새 인식기에 다시 넣어 살림. 같은 말이 앞뒤 줄에 겹칠 수 있음. 측정은 nineouting-ref review/endpoint_cut_check.py)
 - VAD 보완: Silero VAD가 말소리라고 본 구간 중 메인 STT 출력이 덮지 않는 0.5초 이상 부분을,
   말소리 끝 + 2.0초 뒤에 새 스트림으로 다시 인식해 끼움 (한글이 없는 출력은 버림)
 - 화자 번호: TitaNet-small, 발화마다 누적 비교 (Diarizer). 번호만 나옴
@@ -27,7 +29,7 @@ DEFAULT_MODELS = os.path.expanduser('~/Dev/nineouting-ref/stt_models')
 LOW_CONF = 0.3
 
 
-def make_rec(model_dir, chunk, method, endpoint=False, hotwords='', hotwords_score=1.0):
+def make_rec(model_dir, chunk, method, endpoint=False, hotwords='', hotwords_score=1.0, end_silence=0.8, max_len=20.0):
     st = f'-epoch-99-avg-1-chunk-{chunk}-left-128.int8.onnx'
     for f in (f'{model_dir}/tokens.txt', f'{model_dir}/encoder{st}'):
         if not os.path.exists(f):
@@ -35,8 +37,8 @@ def make_rec(model_dir, chunk, method, endpoint=False, hotwords='', hotwords_sco
     return sherpa_onnx.OnlineRecognizer.from_transducer(
         tokens=f'{model_dir}/tokens.txt', encoder=f'{model_dir}/encoder{st}', decoder=f'{model_dir}/decoder{st}',
         joiner=f'{model_dir}/joiner{st}', num_threads=1, sample_rate=SR, feature_dim=80, decoding_method=method,
-        enable_endpoint_detection=endpoint, rule1_min_trailing_silence=2.4, rule2_min_trailing_silence=0.8,
-        rule3_min_utterance_length=20, hotwords_file=hotwords if method == 'modified_beam_search' else '',
+        enable_endpoint_detection=endpoint, rule1_min_trailing_silence=2.4, rule2_min_trailing_silence=end_silence,
+        rule3_min_utterance_length=max_len, hotwords_file=hotwords if method == 'modified_beam_search' else '',
         hotwords_score=hotwords_score, modeling_unit='cjkchar')
 
 
@@ -166,12 +168,16 @@ class AltWorker:
 class Engine:
     def __init__(self, on_event, model_dir=None, vad_model=None, chunk='64', hotwords='', hotwords_score=1.0,
                  wait=2.0, min_gap=0.5, recover=True, keep_seconds=120, spk_model=None, diar=True, alt=True,
-                 max_speakers=0):
+                 max_speakers=0, end_silence=0.8, max_len=20.0, overlap=0.0):
         model_dir = model_dir or f'{DEFAULT_MODELS}/zipformer-174m'
         vad_model = vad_model or f'{DEFAULT_MODELS}/speaker/silero_vad.onnx'
         if not os.path.exists(vad_model):
             raise FileNotFoundError(f'VAD 모델 없음: {vad_model}')
-        self.rec = make_rec(model_dir, chunk, 'modified_beam_search', endpoint=True, hotwords=hotwords, hotwords_score=hotwords_score)
+        self.rec = make_rec(model_dir, chunk, 'modified_beam_search', endpoint=True, hotwords=hotwords, hotwords_score=hotwords_score,
+                            end_silence=end_silence, max_len=max_len)
+        self.max_len, self.overlap, self.end_silence = max_len, overlap, end_silence
+        self.shift = 0.0     # 인식기 시각 - 실제 시각 (강제 분할 때 소리를 다시 넣은 만큼 앞섬)
+        self.seg_len = 0.0   # 지금 줄을 시작한 뒤 인식기에 넣은 소리 길이 (강제 분할 판단용)
         self.diar = Diarizer(spk_model or f'{DEFAULT_MODELS}/speaker/nemo_en_titanet_small.onnx',
                              max_speakers=max_speakers) if diar else None
         self.alt = AltWorker(model_dir, on_event) if alt else None
@@ -187,14 +193,15 @@ class Engine:
         self.fed = 0.0; self.buf = np.zeros(0, np.float32); self.buf_t0 = 0.0  # 최근 소리 (메모리에만)
         self.vad_q = np.zeros(0, np.float32); self.cover = []; self.pending = []
         self.next_id = 0; self.cur_id = None; self.shown = ''
+        self.restart = False   # 화면 지우기 때 서버가 켬: 다음 소리부터 새 줄로 시작 (지우기 전에 시작한 줄에 이어 붙어 버려지는 것을 막음)
 
     def _new_id(self):
         self.next_id += 1
         return self.next_id
 
-    @staticmethod
-    def _span(r):
-        return (r.start_time + r.timestamps[0], r.start_time + r.timestamps[-1] + 0.2) if len(r.timestamps) else None
+    def _span(self, r):
+        t = r.start_time - self.shift
+        return (t + r.timestamps[0], t + r.timestamps[-1] + 0.2) if len(r.timestamps) else None
 
     def _audio(self, t0, t1):
         b0, b1 = max(self.buf_t0, t0), min(self.fed, t1)
@@ -203,15 +210,27 @@ class Engine:
     def feed(self, c):
         """0.1초 안팎의 float32 모노 16kHz 소리."""
         s, rec = self.s, self.rec
-        s.accept_waveform(SR, c); self.fed += len(c) / SR
+        if self.restart:   # 말하던 줄은 버리고(지우기 전 내용) 인식기를 새로 시작
+            self.restart = False
+            while rec.is_ready(s): rec.decode_stream(s)
+            rec.reset(s); self.cur_id = None; self.shown = ''; self.seg_len = 0.0
+            self.pending = [q for q in self.pending if q[1] > self.fed]
+        s.accept_waveform(SR, c); self.fed += len(c) / SR; self.seg_len += len(c) / SR
         self.buf = np.concatenate([self.buf, c])
         if len(self.buf) > SR * self.keep:
             cut = len(self.buf) - SR * self.keep; self.buf = self.buf[cut:]; self.buf_t0 += cut / SR
         while rec.is_ready(s): rec.decode_stream(s)
         r = rec.get_result_all(s); cur = self._span(r); text = text_conf(r)[0]  # 확정 줄과 같게 띄어쓰기 포함
         if rec.is_endpoint(s):
+            # 쉼이 아니라 최대 길이로 끊김: 줄이 최대 길이에 닿았고, 마지막 글자 뒤 쉼이 쉼 기준보다 짧음
+            tail = self.seg_len - (r.timestamps[-1] if len(r.timestamps) else 0.0)
+            forced = self.seg_len >= self.max_len - 0.3 and tail < self.end_silence
             if text and cur: self._final(cur, r)
-            rec.reset(s); cur = None; self.cur_id = None; self.shown = ''
+            rec.reset(s); cur = None; self.cur_id = None; self.shown = ''; self.seg_len = 0.0
+            if forced and self.overlap > 0:   # 걸쳐 있던 단어를 새 줄에서 다시 듣게 함
+                seg = self._audio(self.fed - self.overlap, self.fed)
+                s.accept_waveform(SR, seg); self.shift += len(seg) / SR; self.seg_len = len(seg) / SR
+                while rec.is_ready(s): rec.decode_stream(s)
         elif text and text != self.shown and cur:
             if self.cur_id is None: self.cur_id = self._new_id()
             self.shown = text
