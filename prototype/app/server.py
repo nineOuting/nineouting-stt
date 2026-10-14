@@ -42,6 +42,7 @@ p.add_argument('--wav', default=''); p.add_argument('--port', type=int, default=
 p.add_argument('--models', default=DEFAULT_MODELS, help='stt_models 폴더 (기본: nineouting-ref/stt_models)')
 p.add_argument('--chunk', default='64', choices=['16', '64'])
 p.add_argument('--hotwords', default=''); p.add_argument('--hotwords-score', type=float, default=1.0)
+p.add_argument('--blank-penalty', type=float, default=0.5, help='글자 안 냄(blank)에 주는 벌점. 빠지는 말이 줄고 틀린·낀 글자가 조금 늚. 0이면 끔 (1.0부터 삽입 급증)')
 p.add_argument('--no-recover', action='store_true'); p.add_argument('--out', default='', help='첫 세션 전사 파일 경로 (기본: 자동 이름)')
 p.add_argument('--save-dir', default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'transcripts'),
                help='세션 전사·녹음 파일 폴더 (기본: prototype/transcripts, 깃 제외)')
@@ -260,7 +261,7 @@ def _audio_loop():
     eng = ENGINE = Engine(publish, max_speakers=A.max_speakers, model_dir=f'{A.models}/zipformer-174m', vad_model=f'{A.models}/speaker/silero_vad.onnx',
                  chunk=A.chunk, hotwords=A.hotwords, hotwords_score=A.hotwords_score, recover=not A.no_recover,
                  spk_model=f'{A.models}/speaker/nemo_en_titanet_small.onnx', diar=not A.no_diar, alt=not A.no_alt,
-                 max_len=A.max_len, overlap=A.overlap)
+                 max_len=A.max_len, overlap=A.overlap, blank_penalty=A.blank_penalty)
     stream = None; sdq = None; flags = {}
     if A.wav:
         w = wave.open(A.wav); assert w.getframerate() == SR and w.getnchannels() == 1 and w.getsampwidth() == 2
