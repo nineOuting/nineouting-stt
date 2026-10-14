@@ -7,6 +7,9 @@
   다시 넣은 소리에서 앞 줄과 겹쳐 나온 글자는 새 줄 앞에서 뺌 (_trim): 실제 시각이 앞 줄 마지막 글자 이하인 글자 →
   남은 앞부분 중 다시 넣은 구간 안의 글자가 앞 줄 끝(최대 6글자)과 같으면 그만큼. 앞 줄이 내지 못하고 들고 있던 글자는 남김.
   회의 2 정답 10분 CER 9.0 → 5.6%(삽입 111 → 29자, 삭제 42 → 43자), 회의 1 22.6 → 20.7% (nineouting-ref review/overlap_dedup)
+  blank_penalty: 디코딩 때 blank(글자 안 냄)에 주는 벌점. 말을 건너뛰는 삭제를 줄이는 대신 대체·삽입이 조금 늚.
+  0.5에서 삭제 회의 1 89 → 47자, 회의 2 43 → 23자, CER 20.7 → 19.8%, 5.6 → 5.7% (1.0부터 삽입 급증, nineouting-ref review/decode_opts).
+  빠진 말은 화면에서 안 보여 사용자가 고치기 어렵고, 틀린 글자는 보여서 고칠 수 있어 삭제를 줄이는 쪽을 고름. 서버 기본 0.5
 - VAD 보완: Silero VAD가 말소리라고 본 구간 중 메인 STT 출력이 덮지 않는 0.5초 이상 부분을,
   말소리 끝 + 2.0초 뒤에 새 스트림으로 다시 인식해 끼움 (한글이 없는 출력은 버림)
 - 화자 번호: TitaNet-small, 발화마다 누적 비교 (Diarizer). 번호만 나옴
@@ -33,7 +36,7 @@ LOW_CONF = 0.3
 DEDUP_CHARS = 6   # 강제 분할 뒤 새 줄 앞에서 앞 줄 끝과 맞춰 볼 최대 글자 수
 
 
-def make_rec(model_dir, chunk, method, endpoint=False, hotwords='', hotwords_score=1.0, end_silence=0.8, max_len=20.0):
+def make_rec(model_dir, chunk, method, endpoint=False, hotwords='', hotwords_score=1.0, end_silence=0.8, max_len=20.0, blank_penalty=0.0):
     st = f'-epoch-99-avg-1-chunk-{chunk}-left-128.int8.onnx'
     for f in (f'{model_dir}/tokens.txt', f'{model_dir}/encoder{st}'):
         if not os.path.exists(f):
@@ -43,7 +46,7 @@ def make_rec(model_dir, chunk, method, endpoint=False, hotwords='', hotwords_sco
         joiner=f'{model_dir}/joiner{st}', num_threads=1, sample_rate=SR, feature_dim=80, decoding_method=method,
         enable_endpoint_detection=endpoint, rule1_min_trailing_silence=2.4, rule2_min_trailing_silence=end_silence,
         rule3_min_utterance_length=max_len, hotwords_file=hotwords if method == 'modified_beam_search' else '',
-        hotwords_score=hotwords_score, modeling_unit='cjkchar')
+        hotwords_score=hotwords_score, modeling_unit='cjkchar', blank_penalty=blank_penalty)
 
 
 def decode(rec, seg):
@@ -172,13 +175,13 @@ class AltWorker:
 class Engine:
     def __init__(self, on_event, model_dir=None, vad_model=None, chunk='64', hotwords='', hotwords_score=1.0,
                  wait=2.0, min_gap=0.5, recover=True, keep_seconds=120, spk_model=None, diar=True, alt=True,
-                 max_speakers=0, end_silence=0.8, max_len=20.0, overlap=0.0):
+                 max_speakers=0, end_silence=0.8, max_len=20.0, overlap=0.0, blank_penalty=0.0):
         model_dir = model_dir or f'{DEFAULT_MODELS}/zipformer-174m'
         vad_model = vad_model or f'{DEFAULT_MODELS}/speaker/silero_vad.onnx'
         if not os.path.exists(vad_model):
             raise FileNotFoundError(f'VAD 모델 없음: {vad_model}')
         self.rec = make_rec(model_dir, chunk, 'modified_beam_search', endpoint=True, hotwords=hotwords, hotwords_score=hotwords_score,
-                            end_silence=end_silence, max_len=max_len)
+                            end_silence=end_silence, max_len=max_len, blank_penalty=blank_penalty)   # VAD 보완 다시 인식도 이 인식기를 씀
         self.max_len, self.overlap, self.end_silence = max_len, overlap, end_silence
         self.shift = 0.0     # 인식기 시각 - 실제 시각 (강제 분할 때 소리를 다시 넣은 만큼 앞섬)
         self.seg_len = 0.0   # 지금 줄을 시작한 뒤 인식기에 넣은 소리 길이 (강제 분할 판단용)
