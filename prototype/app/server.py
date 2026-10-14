@@ -37,7 +37,8 @@ p = argparse.ArgumentParser()
 p.add_argument('--input', default='sd', choices=['sd', 'ffmpeg'], help='마이크 입력 방식 (sd=sounddevice/CoreAudio, ffmpeg=avfoundation)')
 p.add_argument('--device', default='', help='마이크 장치 번호 (--list-devices). 없으면 sd는 시스템 기본 입력, ffmpeg는 0')
 p.add_argument('--list-devices', action='store_true')
-p.add_argument('--diag', action='store_true', help='30초마다 입력 상태(실제 시간 대비 받은 소리, 읽기 대기, 처리 시간)를 터미널에 출력')
+p.add_argument('--diag', action='store_true', help='30초마다 입력 상태(실제 시간 대비 받은 소리, 읽기 대기, 처리 시간)를 터미널에 출력. '
+               '없어도 마이크 소리가 빠지면(최근 30초 1%% 이상, 입력 넘침) 경고 한 줄은 나옴')
 p.add_argument('--wav', default=''); p.add_argument('--port', type=int, default=8765)
 p.add_argument('--models', default=DEFAULT_MODELS, help='stt_models 폴더 (기본: nineouting-ref/stt_models)')
 p.add_argument('--chunk', default='64', choices=['16', '64'])
@@ -63,6 +64,17 @@ if A.list_devices and A.input == 'sd':
         if d['max_input_channels'] > 0:
             print(f'[{i}] {d["name"]} (입력 {d["max_input_channels"]}채널, {d["default_samplerate"]:.0f}Hz)' + (' ← 기본' if i == sd.default.device[0] else ''))
     sys.exit(0)
+if A.input == 'sd' and not A.wav and A.device:
+    # 장치 번호가 ffmpeg 시절과 달라 마이크가 아닌 장치를 고르기 쉬움 → 열기 전에 확인하고 마이크 목록을 알려 줌
+    import sounddevice as sd
+    devs = sd.query_devices()
+    mics = ', '.join(f'[{i}] {d["name"]}' for i, d in enumerate(devs) if d['max_input_channels'] > 0)
+    try:
+        info = sd.query_devices(int(A.device) if A.device.isdigit() else A.device)
+    except (ValueError, sd.PortAudioError):
+        sys.exit(f'장치 {A.device!r}를 찾지 못함. 마이크: {mics} (--list-devices)')
+    if info['max_input_channels'] < 1:
+        sys.exit(f'장치 {A.device}번 {info["name"]!r}는 마이크가 아님. 마이크: {mics} (--list-devices)')
 if A.list_devices:
     if not FFMPEG: sys.exit('ffmpeg를 찾지 못함')
     r = subprocess.run([FFMPEG, '-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''], capture_output=True, text=True)
@@ -233,11 +245,13 @@ def audio_loop():
 
 
 class Diag:
-    """--diag: 소리 입력 스레드가 시간을 어디에 쓰는지 30초마다 출력 (멈춘 동안은 세지 않음)"""
-    def __init__(self, q=None, flags=None):
-        self.q, self.flags = q, flags or {}
+    """소리 입력 스레드가 시간을 어디에 쓰는지 셈 (멈춘 동안은 세지 않음).
+    --diag: 30초마다 출력. 없으면 최근 30초에 빠진 소리가 1% 이상이거나 입력 넘침이 새로 생겼을 때만 경고 한 줄"""
+    def __init__(self, q=None, flags=None, verbose=False):
+        self.q, self.flags, self.verbose = q, flags or {}, verbose
         self.last = self.t_rep = time.perf_counter(); self.n_err = 0
         self.wall = self.got = self.read = self.feed = self.pub = self.rec = 0.0; self.n = self.instant = 0; self.maxq = 0
+        self.prev = (0.0, 0.0, 0)   # 지난 출력 때의 (실행 시간, 받은 소리, 입력 넘침)
 
     def tick(self, running):
         now = time.perf_counter()
@@ -247,6 +261,16 @@ class Diag:
         if now - self.t_rep >= 30 and self.wall > 0:
             self.t_rep = now
             lost = (1 - self.got / self.wall) * 100
+            over = sum(self.flags.values())
+            dw, dg = self.wall - self.prev[0], self.got - self.prev[1]
+            recent = (1 - dg / dw) * 100 if dw > 1 else 0.0
+            bad = recent >= 1.0 or over > self.prev[2]
+            self.prev = (self.wall, self.got, over)
+            if not self.verbose:
+                if bad:
+                    print(f'[경고] 마이크 소리가 빠지고 있음: 최근 {dw:.0f}초 중 {recent:.1f}% 빠짐, 입력 넘침 누적 {over}번 '
+                          f'(전체 {lost:.1f}%). 자세히 보려면 --diag', file=sys.stderr, flush=True)
+                return
             msg = (f'[진단] 실행 {self.wall:.0f}초 · 받은 소리 {self.got:.0f}초 (빠짐 {lost:.1f}%) · 읽기 대기 {self.read:.1f}초 '
                    f'(바로 읽힘 {self.instant / max(self.n, 1) * 100:.0f}%) · 엔진 {self.feed - self.pub:.1f}초 · 알림·저장 {self.pub:.1f}초 · 녹음 쓰기 {self.rec:.1f}초')
             if self.q is not None: msg += f' · 대기열 최대 {self.maxq * 0.1:.1f}초'
@@ -291,7 +315,7 @@ def _audio_loop():
         threading.Thread(target=lambda: ffmpeg_err.extend(l.decode(errors='replace').rstrip() for l in proc.stderr),
                          daemon=True).start()
         read = lambda: proc.stdout.read(3200)
-    D = Diag(sdq, flags) if A.diag else None
+    D = Diag(sdq, flags, verbose=A.diag) if (A.diag or not A.wav) else None   # 마이크 입력은 항상 지켜봄 (문제 있을 때만 경고)
     if D:   # 엔진이 부르는 화면 알림·파일 저장 시간을 따로 셈 (다른 결과 스레드의 알림은 세지 않음)
         def timed(ev, _p=publish):
             t = time.perf_counter(); _p(ev); D.pub += time.perf_counter() - t

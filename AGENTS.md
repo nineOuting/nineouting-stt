@@ -3,6 +3,7 @@
 ## 구조
 - prototype/: 회의 실시간 전사 웹 프로토타입 (app/engine.py, app/summary_sender.py, app/server.py, app/static/index.html)
 - 실행: cd prototype && .venv/bin/python app/server.py --device <번호>  → http://localhost:8765
+  (마이크 입력은 sounddevice. 장치 번호는 --list-devices로 확인. ffmpeg 입력 때의 번호와 다름)
 - 설치: python3 -m venv .venv && .venv/bin/pip install --only-binary=:all: -r requirements.txt
 
 ## 프로토타입의 범위
