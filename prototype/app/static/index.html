@@ -21,7 +21,7 @@
   body { margin: 0; background: var(--bg); color: var(--fg);
          font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
   header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
-           padding: 12px 20px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+           padding: 12px calc(20px + var(--cut-r, 0px)) 12px calc(20px + var(--cut-l, 0px)); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   h1 { font-size: 17px; margin: 0; font-weight: 600; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
   .dot.on { background: var(--ok); animation: pulse 1.6s infinite; }
@@ -35,7 +35,16 @@
   .btn.ghost { color: var(--muted); }
   .btn.ghost + .btn { margin-left: 0; }
   .btn[aria-expanded="true"] { background: var(--rec-bg); }
-  .ctls { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+  /* 보기 설정: 스위치·참석자 입력을 접어 상단 바를 한 줄(약 950px)로 줄임 */
+  .viewopts { position: relative; flex: none; }
+  .viewopts summary { list-style: none; margin-left: 0; user-select: none; display: inline-block; white-space: nowrap; }
+  .viewopts summary::-webkit-details-marker { display: none; }
+  .viewopts[open] summary { background: var(--rec-bg); }
+  .vmenu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 6; display: flex; flex-direction: column; gap: 10px;
+           background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
+           box-shadow: 0 6px 18px rgba(0,0,0,.15); white-space: nowrap; }
+  .vmenu .switch { font-size: 14px; color: var(--fg); }
+  .ctls { display: flex; align-items: center; gap: 6px; margin-left: 8px; }   /* 오른쪽 끝에 붙이지 않음: 창이 모니터보다 넓어도 버튼이 보이게 */
   .ctls .btn { margin-left: 0; }
   .ctls + .btn { margin-left: 0; }
   .btn.recst { color: var(--recred); }
@@ -44,7 +53,7 @@
   .recind.on::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--recred); animation: pulse 1.2s infinite; }
   .recind.pause { color: var(--rec-tag); }
   main { max-width: 860px; margin: 0 auto; padding: 16px 20px 40vh; transition: margin .2s; }
-  body.open main { margin-right: 360px; }
+  body.open main { margin-right: calc(360px + var(--cut-r, 0px)); }
   .ln { display: grid; grid-template-columns: 56px 1fr; gap: 12px; padding: 6px 8px; border-radius: 6px;
         transition: background-color 2.5s ease; }
   .t { color: var(--muted); font-size: 13px; padding-top: 3px; font-variant-numeric: tabular-nums; }
@@ -109,16 +118,51 @@
   .spksel { font: inherit; font-size: 13px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); color: var(--fg); }
   aside li .alts { display: block; font-size: 13px; margin-top: 2px; }
   .empty { color: var(--muted); text-align: center; padding: 48px 0; }
+  /* 줄마다 요약 전송 표시 (시각 아래) */
+  .t .sb { display: block; font-size: 10.5px; line-height: 1.3; margin-top: 2px; color: var(--muted); white-space: nowrap; cursor: help; }
+  .t .sb.wait { color: var(--rec-tag); }
+  /* 요약 전송 상태창 */
+  .sendsum { padding: 10px 16px 4px; font-size: 13px; color: var(--muted); display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+  .sendsum b { color: var(--fg); font-weight: 600; overflow-wrap: anywhere; }
+  .sendsum .bad { color: #dc2626; }
+  .sendbody { overflow-y: auto; flex: 1; padding: 4px 12px 16px; }
+  .sendbody h3 { font-size: 13px; margin: 14px 4px 6px; color: var(--muted); font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
+  .sendbody h3 .cd { font-weight: 500; font-variant-numeric: tabular-nums; }
+  .sendbody ul, .sendbody ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .sendbody .none { color: var(--muted); font-size: 13px; padding: 4px; }
+  .sendbody li { display: block; cursor: default; padding: 0; transition: none; font-size: inherit; }   /* 보완 목록의 aside li 모양을 덮어씀 */
+  .sendbody li:hover { background: none; }
+  .pkt { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 13px; background: var(--bg); }
+  .pkt.pending { border-style: dashed; }
+  .pkt .ph { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 4px; }
+  .pkt .ph b { font-size: 13.5px; }
+  .pkt .ph time { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .res { font-size: 11px; font-weight: 600; border-radius: 4px; padding: 0 6px; }
+  .res.ok { color: var(--ok); border: 1px solid currentColor; }
+  .res.file { color: var(--muted); border: 1px solid currentColor; }
+  .res.fail { color: #dc2626; border: 1px solid currentColor; }
+  .pkt .it { display: grid; grid-template-columns: 74px 1fr; gap: 6px; padding: 2px 0; }
+  .pkt .it .k { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .pkt .it .v { min-width: 0; overflow-wrap: anywhere; }
+  .pkt .it .v .mini { font-size: 10.5px; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; margin-right: 4px; color: var(--muted); white-space: nowrap; }
+  .pkt .it .v .mini.lc { color: var(--rec-tag); border-color: currentColor; }
+  .pkt .it.del .v { color: var(--muted); text-decoration: line-through; }
+  .pkt > .why { font-size: 12px; color: #dc2626; margin-bottom: 2px; }
+  .t .sb.fail { color: #dc2626; }
+  .pkt details { margin-top: 4px; }
+  .pkt summary { font-size: 11.5px; color: var(--muted); cursor: pointer; }
+  .pkt pre { margin: 4px 0 0; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere;
+             max-height: 220px; overflow: auto; background: var(--panel); border-radius: 4px; padding: 6px; }
   #latest { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 2; display: none;
             font: inherit; font-size: 14px; color: #fff; background: var(--accent); border: none; border-radius: 999px;
             padding: 6px 14px; cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,.2); }
   #latest.show { display: block; }
   body.open #latest { left: calc(50% - 180px); }
 
-  aside { position: fixed; top: 0; right: 0; bottom: 0; width: 360px; z-index: 3; background: var(--panel);
-          border-left: 1px solid var(--line); transform: translateX(100%); transition: transform .2s;
+  aside { position: fixed; top: var(--hdr-h, 0px);   /* 상단 바 아래에서 시작해 버튼을 가리지 않음 */ right: var(--cut-r, 0px);   /* 창이 모니터 밖으로 나간 만큼 안쪽으로 */ bottom: 0; width: 360px; z-index: 3; background: var(--panel);
+          border-left: 1px solid var(--line); transform: translateX(calc(100% + var(--cut-r, 0px)));   /* 닫힌 패널은 당긴 만큼 더 밀어 완전히 숨김 */ transition: transform .2s;
           display: flex; flex-direction: column; }
-  body.open aside { transform: none; }
+  aside.show { transform: none; }
   aside .hd { display: flex; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line); gap: 8px; }
   aside h2 { margin: 0; font-size: 15px; }
   aside .sub { color: var(--muted); font-size: 12px; padding: 8px 16px 0; }
@@ -139,7 +183,7 @@
     .ln { grid-template-columns: 46px 1fr; gap: 8px; }
     aside { top: auto; left: 0; width: auto; height: 55vh; border-left: none; border-top: 1px solid var(--line);
             transform: translateY(100%); border-radius: 12px 12px 0 0; box-shadow: 0 -8px 24px rgba(0,0,0,.15); }
-    body.open aside { transform: none; }
+    aside.show { transform: none; }
   }
 </style>
 </head>
@@ -148,6 +192,9 @@
   <span class="dot" id="dot"></span>
   <h1>회의 실시간 전사</h1>
   <span class="meta" id="meta">연결 중…</span>
+  <details class="viewopts" id="viewOpts">
+  <summary class="btn ghost" title="화면 표시 설정">보기 설정 ▾</summary>
+  <div class="vmenu">
   <label class="switch" title="모델 확신도가 0.3 미만인 글자에 점선을 긋습니다 (회의 2 기준 표시된 글자 4개 중 1개꼴로 실제 오류)">
     <input type="checkbox" id="lowSw" checked> 확신 낮은 글자</label>
   <label class="switch" title="참석자 수를 넣으면 그 인원이 다 찬 뒤로는 새 화자를 만들지 않고 가장 가까운 화자에 붙입니다. 비우면 자동">
@@ -156,6 +203,8 @@
     <input type="checkbox" id="simSw" checked> 유사도</label>
   <label class="switch" title="'네네', '그쵸', '어', '그'처럼 맞장구·간투사로만 된 줄을 숨깁니다. 끄면 흐리게 보여 줍니다. 지우는 것이 아니며 저장본에는 남습니다">
     <input type="checkbox" id="minorSw"> 맞장구 숨기기</label>
+  </div>
+  </details>
   <div class="ctls">
     <span class="recind" id="recInd" aria-live="polite"></span>
     <button class="btn recst" id="recStart" hidden>● 녹음 시작</button>
@@ -163,6 +212,7 @@
     <button class="btn ghost" id="doneBtn" hidden title="이 세션의 전사 파일(과 녹음)을 닫고 대기합니다">완료</button>
   </div>
   <button class="btn ghost" id="clearBtn" title="지금까지의 전사문을 모두 지웁니다 (되돌릴 수 없음)">지우기</button>
+  <button class="btn ghost" id="sendBtn" aria-expanded="false" aria-controls="sendPanel" title="요약 쪽으로 무엇이 언제 어떻게 보내졌는지 봅니다">요약 전송</button>
   <button class="btn" id="recBtn" aria-expanded="false" aria-controls="recPanel" disabled>보완 0건</button>
 </header>
 <main id="list"><div class="empty" id="empty">말을 시작하면 여기에 전사문이 나타납니다.</div></main>
@@ -173,6 +223,17 @@
     <button class="close" id="recClose" aria-label="닫기">×</button></div>
   <div class="sub">STT가 놓친 말소리를 VAD로 찾아 다시 인식한 줄. 누르면 본문 위치로 이동합니다.</div>
   <ol id="recList"><li class="none" id="recNone">아직 없습니다.</li></ol>
+</aside>
+<aside id="sendPanel" aria-label="요약 전송 상태">
+  <div class="hd"><h2>요약 전송</h2><span class="meta" id="sendCount"></span>
+    <button class="close" id="sendClose" aria-label="닫기">×</button></div>
+  <div class="sendsum" id="sendSum"></div>
+  <div class="sendbody">
+    <h3>다음 묶음 <span class="cd" id="sendNext"></span></h3>
+    <ul id="sendPending"><li class="none">없음</li></ul>
+    <h3>보낸 기록 <span class="cd">(최근 것부터)</span></h3>
+    <ol id="sendLog"><li class="none">아직 없습니다.</li></ol>
+  </div>
 </aside>
 <script>
 const list = document.getElementById('list'), meta = document.getElementById('meta'), dot = document.getElementById('dot');
@@ -306,10 +367,14 @@ function renderLine(el) {
   x.append(el$('span', 'txt'));
   renderConf(el, d.text, d.conf);
   if (d.edited) { const b = el$('span', 'edited', d.edited === 'alt' ? '후보로 바꿈' : '직접 고침'); b.title = `원래: ${d.orig}`; x.append(b); }
+  sendBadge(el);
   const eb = el$('button', 'editbtn', '✎'); eb.title = '직접 고치기'; eb.setAttribute('aria-label', '이 줄 직접 고치기');
   eb.onclick = () => startEdit(el); x.append(eb);
   const ab = el$('button', 'editbtn', '＋'); ab.title = '이 줄 다음에 놓친 말 추가'; ab.setAttribute('aria-label', '이 줄 다음에 줄 추가');
   ab.onclick = () => startAdd(el); x.append(ab);
+  const db = el$('button', 'editbtn', '✕'); db.title = '이 줄 지우기 (말이 아닌데 들어간 줄 등)'; db.setAttribute('aria-label', '이 줄 지우기');
+  db.onclick = () => { if (confirm(`이 줄을 지울까요?\n\n"${d.text.slice(0, 60)}"\n\n· 저장 파일에는 지운 줄로 표시되어 남습니다\n· 요약 쪽에도 삭제로 알립니다`)) postJSON('/delete', { id: d.id }); };
+  x.append(db);
   const opts = options(d);
   if (opts.length) {
     const open = el._altOpen ?? true;   // 기본은 펼친 상태
@@ -439,8 +504,16 @@ function handle(ev) {
     el.classList.remove('partial'); el.dataset.start = ev.start;
     el.querySelector('.t').textContent = fmt(ev.start);
     el._d = { ...ev };
+    if (ev.sent_seq) sentSeq.set(ev.id, ev.sent_seq);
+    if (ev.edit_sent_seq) editSeq.set(ev.id, ev.edit_sent_seq);
     renderLine(el); place(el);
     if (ev.type === 'recovered') { addRec(el._d); flash(el); }
+  } else if (ev.type === 'delete') {   // 지운 줄: 본문과 보완 목록에서 뺌
+    el?.remove(); rows.delete(ev.id);
+    const li = recs.get(ev.id);
+    if (li) { li.remove(); recs.delete(ev.id); recBtn.textContent = `보완 ${recs.size}건`; recCount.textContent = `${recs.size}건`;
+              if (!recs.size) { recBtn.disabled = true; recList.innerHTML = '<li class="none" id="recNone">아직 없습니다.</li>'; } }
+    return;
   } else if (ev.type === 'merge') {   // 화자 src → dst: 해당 줄 번호를 모두 바꿈
     for (const r of rows.values()) {
       if (r._d && r._d.spk === ev.src) { r._d.spk = ev.dst; r._d.merged_from = ev.src; renderLine(r); if (recs.has(r._d.id)) addRec(r._d); }
@@ -458,11 +531,140 @@ function handle(ev) {
   if (follow) { jumpUntil = Date.now() + 100; window.scrollTo(0, document.body.scrollHeight); }
 }
 
-function togglePanel(open) {
-  open = open ?? !document.body.classList.contains('open');
-  document.body.classList.toggle('open', open); recBtn.setAttribute('aria-expanded', open);
+// 창이 모니터 밖으로 나가 있으면 그만큼(--cut-l, --cut-r) 상단 바와 오른쪽 패널을 안쪽으로 당김.
+// 창을 옮기면 이벤트가 없어 1초마다 다시 잼. 창이 모니터 안에 다 있으면 둘 다 0
+function fitScreen() {
+  const sl = screen.availLeft ?? 0, sw = screen.availWidth, border = Math.max(0, (outerWidth - innerWidth) / 2);
+  const left = screenX + border;                           // 페이지 왼쪽 끝의 모니터 좌표
+  const cutL = Math.max(0, Math.round(sl - left));
+  const cutR = Math.max(0, Math.round(left + innerWidth - (sl + sw)));
+  const r = document.documentElement.style;
+  if (r.getPropertyValue('--cut-l') !== cutL + 'px') r.setProperty('--cut-l', cutL + 'px');
+  if (r.getPropertyValue('--cut-r') !== cutR + 'px') r.setProperty('--cut-r', cutR + 'px');
+  return [cutL, cutR];
 }
+fitScreen(); setInterval(fitScreen, 1000); addEventListener('resize', fitScreen);
+
+// 보기 설정: 바깥을 누르거나 Esc면 닫음
+const viewOpts = document.getElementById('viewOpts');
+document.addEventListener('click', e => { if (viewOpts.open && !viewOpts.contains(e.target)) viewOpts.open = false; });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') viewOpts.open = false; });
+
+// 오른쪽 패널: 보완 목록(rec)과 요약 전송(send) 중 하나만 열림. 상단 바 높이만큼 내려서 염 (화면 폭에 따라 바가 두 줄이 됨)
+const hdr = document.querySelector('header');
+new ResizeObserver(() => document.documentElement.style.setProperty('--hdr-h', hdr.offsetHeight + 'px')).observe(hdr);
+const recPanel = document.getElementById('recPanel'), sendPanel = document.getElementById('sendPanel'), sendBtn = document.getElementById('sendBtn');
+let panel = null;
+function setPanel(name) {
+  panel = name;
+  recPanel.classList.toggle('show', name === 'rec'); sendPanel.classList.toggle('show', name === 'send');
+  recBtn.setAttribute('aria-expanded', name === 'rec'); sendBtn.setAttribute('aria-expanded', name === 'send');
+  document.body.classList.toggle('open', !!name);
+}
+function togglePanel(open) { setPanel((open ?? panel !== 'rec') ? 'rec' : null); }
 recBtn.onclick = () => togglePanel();
+sendBtn.onclick = () => setPanel(panel === 'send' ? null : 'send');
+document.getElementById('sendClose').onclick = () => setPanel(null);
+
+// ---- 요약 전송 상태 ----
+// 서버가 보낸 것: send_init(접속 때 기록 전체), send_pending(대기 목록이 바뀜), send(묶음·알림을 보냄)
+const sentSeq = new Map(), editSeq = new Map(), failSeq = new Set();   // failSeq: 보내지 못한 묶음 번호   // 줄 id → 그 줄이 / 그 줄의 수정이 들어간 묶음 번호
+let snap = null, pendLines = new Set(), pendEdits = new Set();
+const EVT = { start: '회의 시작', pause: '멈춤', resume: '재개', end: '회의 끝' };
+const RES = { ok: ['ok', '보냄'], file: ['file', '파일에만 기록'], fail: ['fail', '실패'] };
+const fmtMs = ms => fmt(ms / 1000);
+const clock = w => (w || '').slice(11, 19);
+function sendBadge(el) {
+  const d = el._d; if (!d) return;
+  el.querySelector('.t .sb')?.remove();
+  let txt = '', cls = 'sb', tip = '';
+  if (pendLines.has(d.id)) { txt = '대기'; cls += ' wait'; tip = '다음 묶음으로 요약 쪽에 보낼 줄'; }
+  else if (pendEdits.has(d.id)) { txt = '수정 대기'; cls += ' wait'; tip = '이미 보낸 줄. 고친 내용(또는 삭제)을 다음 묶음으로 보냄'; }
+  else if (sentSeq.has(d.id)) { const q = sentSeq.get(d.id), eq = editSeq.get(d.id);
+    txt = `#${q}` + (failSeq.has(q) ? ' 실패' : ''); tip = `${q}번 묶음으로 보냄` + (failSeq.has(q) ? ' (요약 쪽에 전달되지 않음)' : '');
+    if (eq) { txt += ` · 수정 #${eq}` + (failSeq.has(eq) ? ' 실패' : ''); tip += `, 고친 내용은 ${eq}번 묶음으로 보냄` + (failSeq.has(eq) ? ' (전달되지 않음)' : ''); }
+    if (failSeq.has(q) || (eq && failSeq.has(eq))) cls += ' fail'; }
+  if (!txt) return;
+  const b = el$('span', cls, txt); b.title = tip; el.querySelector('.t').append(b);
+}
+function itemRow(k, v, cls) { const r = el$('li', 'it' + (cls ? ' ' + cls : '')); r.append(el$('span', 'k', k)); r.append(v); return r; }
+function lineItem(x) {
+  const v = el$('span', 'v');
+  if (x.type === 'recovered') v.append(el$('span', 'mini', '보완'));
+  if (x.type === 'manual') v.append(el$('span', 'mini', '직접 추가'));
+  if (x.kind) v.append(el$('span', 'mini', KIND[x.kind]));
+  if (x.low_confidence) { const m = el$('span', 'mini lc', '신뢰도 낮음'); m.title = '줄 글자 중 확률 0.3 미만이 20% 이상'; v.append(m); }
+  v.append(x.text);
+  return itemRow(`줄 ${x.id} · ${fmtMs(x.start_ms)}`, v);
+}
+function editItem(x) {
+  if (x.deleted) return itemRow(`삭제 · 줄 ${x.id}`, el$('span', 'v', rows.get(x.id)?._d?.text ?? '(지운 줄)'), 'del');
+  return itemRow(`수정 · 줄 ${x.id}`, el$('span', 'v', `${x.rev}번째 고침 → ${x.text}`));
+}
+function packet(e) {
+  const m = e.msg, li = el$('li', 'pkt'), h = el$('div', 'ph');
+  h.append(el$('b', null, m.event ? EVT[m.event] || m.event : `#${m.seq} 묶음`), el$('time', null, clock(e.wall)));
+  const [rc, rt] = RES[e.result] || ['file', e.result]; const r = el$('span', 'res ' + rc, rt);
+  if (e.error) r.title = e.error;
+  h.append(r);
+  if (m.event) h.append(el$('span', 'k', `음성 ${fmtMs(m.at_ms)}`));
+  li.append(h);
+  if (e.error) li.append(el$('div', 'why', `이유: ${e.error}`));
+  const ul = el$('ul');
+  for (const x of m.lines || []) ul.append(lineItem(x));
+  for (const x of m.edits || []) ul.append(editItem(x));
+  if (ul.children.length) li.append(ul);
+  const det = el$('details'); det.append(el$('summary', null, '보낸 JSON'), el$('pre', null, JSON.stringify(m, null, 2)));
+  li.append(det);
+  return li;
+}
+function renderSnap() {
+  if (!snap) return;
+  pendLines = new Set(snap.pending_lines.map(x => x.id)); pendEdits = new Set(snap.pending_edits.map(x => x.id));
+  const st = snap.stats, sum = document.getElementById('sendSum'); sum.textContent = '';
+  const row = (k, v, bad) => { sum.append(el$('span', null, k)); const b = el$('b', bad ? 'bad' : null, v); sum.append(b); return b; };
+  row('받는 곳', snap.url || '없음 · 파일(outbox)에만 기록').title = snap.outbox || '';
+  row('회의', snap.meeting_id || '-');
+  row('주기', `${snap.period}초마다, 보낼 것이 있을 때만`);
+  row('보낸 묶음', `${snap.seq || 0}개`);
+  if (snap.url) row('결과', `성공 ${st.sent} · 실패 ${st.failed}`, st.failed > 0);
+  const pend = document.getElementById('sendPending'); pend.textContent = '';
+  const n = snap.pending_lines.length + snap.pending_edits.length;
+  if (!n) pend.append(el$('li', 'none', '없음'));
+  else { const li = el$('li', 'pkt pending'), ul = el$('ul');
+         for (const x of snap.pending_lines) ul.append(lineItem(x));
+         for (const x of snap.pending_edits) ul.append(editItem(x));
+         li.append(ul); pend.append(li); }
+  sendBtn.textContent = `요약 전송 #${snap.seq || 0}` + (st.failed ? ` · 실패 ${st.failed}` : '');
+  document.getElementById('sendCount').textContent = n ? `대기 ${n}` : '';
+  for (const r of rows.values()) if (r._d) sendBadge(r);
+  tickCd();
+}
+function tickCd() {
+  if (!snap) return;
+  const left = Math.max(0, Math.ceil(snap.tick + snap.period - Date.now() / 1000));
+  const n = snap.pending_lines.length + snap.pending_edits.length;
+  document.getElementById('sendNext').textContent = n ? `${left}초 뒤 보냄` : `다음 주기 ${left}초 뒤`;
+}
+setInterval(tickCd, 1000);
+function addPacket(e) {
+  if (e.result === 'fail' && e.msg.seq) failSeq.add(e.msg.seq);
+  const log = document.getElementById('sendLog'); log.querySelector('.none')?.remove();
+  log.prepend(packet(e));
+  while (log.children.length > 300) log.lastChild.remove();
+}
+function handleSend(ev) {
+  if (ev.type === 'send_init') {
+    document.getElementById('sendLog').innerHTML = '<li class="none">아직 없습니다.</li>';
+    for (const e of ev.history) addPacket(e);
+  } else if (ev.type === 'send') {
+    const m = ev.entry.msg;
+    for (const x of m.lines || []) sentSeq.set(x.id, m.seq);
+    for (const x of m.edits || []) editSeq.set(x.id, m.seq);
+    addPacket(ev.entry);
+  }
+  snap = ev.snap; renderSnap();
+}
 
 // 전사문 지우기: 서버 기록까지 지움 (같은 주소를 연 다른 화면도 비워짐). 인식은 계속됨
 document.getElementById('clearBtn').onclick = async () => {
@@ -476,7 +678,7 @@ function clearAll() {
   rows.clear(); recs.clear();
   list.innerHTML = '<div class="empty" id="empty">말을 시작하면 여기에 전사문이 나타납니다.</div>';
   recList.innerHTML = '<li class="none" id="recNone">아직 없습니다.</li>';
-  recBtn.disabled = true; recBtn.textContent = '보완 0건'; recCount.textContent = ''; togglePanel(false); setFollow(true);
+  recBtn.disabled = true; recBtn.textContent = '보완 0건'; recCount.textContent = ''; if (panel === 'rec') setPanel(null); setFollow(true);
 }
 const lowSw = document.getElementById('lowSw');
 try { lowSw.checked = localStorage.getItem('hideLow') !== '1'; } catch (e) {}
@@ -494,7 +696,7 @@ const applyMinor = () => { document.body.classList.toggle('hide-minor', minorSw.
                            try { localStorage.setItem('hideMinor', minorSw.checked ? '1' : '0'); } catch (e) {} };
 minorSw.onchange = applyMinor; applyMinor();
 document.getElementById('recClose').onclick = () => togglePanel(false);
-document.addEventListener('keydown', e => { if (e.key === 'Escape') togglePanel(false); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') setPanel(null); });
 
 // 화자 합치기 메뉴: 칩을 누르면 지금 화면에 있는 다른 화자 목록을 보여줌
 const mergeMenu = document.getElementById('mergeMenu');
@@ -570,7 +772,8 @@ const es = new EventSource('/events');
 es.addEventListener('hello', e => showStatus(JSON.parse(e.data)));
 es.addEventListener('tick', e => showStatus(JSON.parse(e.data)));
 es.onmessage = e => { const ev = JSON.parse(e.data);
-                      ev.type === 'status' ? showStatus(ev) : ev.type === 'clear' ? clearAll() : handle(ev); };
+                      ev.type === 'status' ? showStatus(ev) : ev.type === 'clear' ? clearAll()
+                      : ev.type.startsWith('send') ? handleSend(ev) : handle(ev); };
 es.onerror = () => { dot.classList.remove('on'); meta.textContent = '서버 연결 끊김 (서버를 다시 실행하면 새로고침)'; };
 </script>
 </body>

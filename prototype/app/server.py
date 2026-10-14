@@ -16,13 +16,18 @@ http://localhost:8765 에서 열림. 외부로 보내지 않음. 녹음은 저�
   일시정지/계속: 전사와 녹음을 같이 멈춤. 멈출 때 무음 2.5초를 넣어 말하던 줄과 보완 판단을 마무리함 (녹음에도 들어감)
   완료: 세션을 닫고 대기. 닫은 세션의 줄을 고치면 그 파일에 반영됨. 대기에서 녹음 시작 → 화면을 비우고 새 세션 파일
   시각: 줄의 start·end는 서버 시작 뒤 엔진에 넣은 소리 기준 초 (멈춘 동안은 늘지 않음). wav 안의 시각 = start - wav_t0 (파일 첫 줄 _meta)
+
+요약 쪽 전송 (summary_sender.py, 2026-10-14 회의에서 정한 형식)
+  세션 = 회의. 세션마다 meeting_id를 붙이고, 확정 줄을 --send-period초(기본 10)마다 묶어 보냄. 시작·멈춤·재개·끝 알림은 바로 보냄
+  --summary-url이 없으면 세션 파일 옆 <이름>.outbox.jsonl 에만 기록
 """
-import argparse, datetime, json, os, queue, shutil, subprocess, sys, threading, time, wave
+import argparse, datetime, json, os, queue, shutil, signal, subprocess, sys, threading, time, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from engine import Engine, SR, DEFAULT_MODELS, line_kind  # noqa: E402
+from summary_sender import Sender  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 p = argparse.ArgumentParser()
@@ -37,6 +42,11 @@ p.add_argument('--save-dir', default=os.path.join(os.path.dirname(os.path.dirnam
 p.add_argument('--no-diar', action='store_true', help='화자 번호 표시 끄기')
 p.add_argument('--no-alt', action='store_true', help='다른 인식 결과 끄기 (메모리 약 300MB 절약, 추정)')
 p.add_argument('--max-speakers', type=int, default=0, help='참석자 수 (0이면 자동). 화면에서도 바꿀 수 있음')
+p.add_argument('--max-len', type=float, default=10.0, help='한 줄 최대 길이(초). 쉼 없이 길게 말하면 이 길이에서 끊음 (이전 20)')
+p.add_argument('--overlap', type=float, default=1.0, help='최대 길이로 끊을 때 직전 소리를 새 줄에 다시 넣는 길이(초). 걸친 단어를 살리는 대신 앞뒤 줄에 겹칠 수 있음. 0이면 끔')
+p.add_argument('--summary-url', default='', help='요약 쪽 받는 주소 (예: http://localhost:8000/stt). 없으면 outbox 파일에만 기록')
+p.add_argument('--send-period', type=float, default=10.0, help='요약 쪽 전송 주기(초)')
+p.add_argument('--meeting-id', default='', help='첫 회의의 meeting_id (앱이 줄 값. 없으면 자동)')
 A = p.parse_args()
 
 FFMPEG = shutil.which('ffmpeg')
@@ -46,7 +56,7 @@ if A.list_devices:
     print('\n'.join(l for l in r.stderr.splitlines() if 'AVFoundation' in l)); sys.exit(0)
 
 # ---- 이벤트 저장·배포 ----
-lock = threading.Lock()
+lock = threading.RLock()   # 요약 전송 알림이 publish 안에서 다시 publish를 부를 수 있어 재진입 허용
 lines = {}          # id → 확정·보완 줄 (새로 접속한 화면에 보냄)
 partial = None      # 지금 말하는 중인 줄
 clients = []        # 화면별 큐
@@ -54,25 +64,41 @@ status = {'source': A.wav or f'마이크 {A.device}', 'audio_sec': 0.0, 'running
           'state': 'run', 'rec': False, 'rec_sec': 0.0, 'session': ''}   # state: run(전사 중) / pause(일시정지) / idle(완료 후 대기)
 ENGINE = None       # 화면에서 화자 합치기·참석자 수를 바꿀 때 씀
 manual_seq = 0      # 직접 추가한 줄 번호
+SENDER = Sender(A.summary_url, A.send_period, now=lambda: ENGINE.fed if ENGINE else 0.0,
+                log=lambda m: print(m, file=sys.stderr, flush=True), on_update=lambda ev: publish(ev))
 
 
-clear_at = -1.0     # 마지막으로 지운 오디오 시각. 이보다 앞에서 시작한 줄은 나중에 도착해도 버림
+clear_at = -1.0     # 마지막으로 지운 오디오 시각. 이보다 앞에서 시작한 보완 줄은 나중에 도착해도 버림
+clear_id = 0        # 지울 때의 엔진 줄 번호. 이 번호 이하의 말하던·확정 줄은 지우기 전 줄이라 버림
+                    # (인식기는 글자로 안 바꾼 소리를 약 1.2초 들고 있어서, 지운 뒤 새 줄의 시작 시각이 지운 시각보다 조금 앞설 수 있음 → 시각으로 거르면 지운 뒤 말까지 버려짐)
 
 
 def publish(ev):
-    global partial, clear_at
+    global partial, clear_at, clear_id
     with lock:
-        if ev['type'] in ('partial', 'final', 'recovered') and ev['start'] < clear_at:
-            return   # 지우기 전에 시작한 줄 (말하던 중이던 줄, 판단 대기 중이던 보완)
+        if (ev['type'] in ('partial', 'final') and ev['id'] <= clear_id) or (ev['type'] == 'recovered' and ev['start'] < clear_at):
+            return   # 지우기 전 줄 (말하던 중이던 줄, 판단 대기 중이던 보완)
         if ev['type'] == 'partial':
             partial = ev
+        elif ev['type'] in ('send', 'send_pending'):   # 요약 전송 상태창. 보낸 줄·수정에 묶음 번호를 붙여 둠 (새로 접속한 화면용)
+            m = ev.get('entry', {}).get('msg', {})
+            for x in m.get('lines', []):
+                if x['id'] in lines: lines[x['id']]['sent_seq'] = m['seq']
+            for x in m.get('edits', []):
+                if x['id'] in lines: lines[x['id']]['edit_sent_seq'] = m['seq']
+            for q in clients: q.put(ev)
+            return
         elif ev['type'] == 'status':
             pass
         elif ev['type'] == 'alt':  # 이미 있는 줄에 다른 인식 결과를 붙임 (새로 접속한 화면에도 보내기 위해)
             if ev['id'] not in lines: return   # 지운 줄에 늦게 온 결과는 버림
             lines[ev['id']]['alts'] = ev['alts']
         elif ev['type'] == 'clear':  # 전사 기록 지우기 (모든 화면에 알림)
-            lines.clear(); partial = None; clear_at = status['audio_sec']
+            if not ev.get('session_switch'):   # 같은 회의 안에서 지우면 요약 쪽에도 삭제로 알림 (새 회의로 넘어갈 때는 알리지 않음)
+                for ln in lines.values():
+                    if not ln.get('deleted'): SENDER.edit(ln['id'], ln.get('rev', 0) + 1, deleted=True)
+            lines.clear(); partial = None; clear_at = status['audio_sec']; clear_id = ENGINE.next_id if ENGINE else 0
+            if ENGINE: ENGINE.restart = True   # 지운 뒤에 한 말이 지우기 전 줄에 이어 붙어 버려지지 않게
         elif ev['type'] == 'merge':  # 화자 src를 dst로 합침: 지난 줄 번호를 모두 바꿈
             for ln in lines.values():
                 if ln.get('spk') == ev['src']:
@@ -80,18 +106,26 @@ def publish(ev):
             if partial and partial.get('spk') == ev['src']: partial['spk'] = ev['dst']
         elif ev['type'] == 'edit':  # 사용자가 후보를 고르거나 직접 고침. 처음 텍스트는 orig로 남겨 되돌릴 수 있게 함
             ln = lines.get(ev['id'])
-            if not ln: return
+            if not ln or ln.get('deleted'): return
             if 'orig' not in ln: ln['orig'], ln['orig_conf'] = ln['text'], ln.get('conf')
             if ev['text'] == ln['orig']:   # 원래대로 되돌림
                 ln['text'], ln['conf'] = ln['orig'], ln['orig_conf']; ln.pop('edited', None)
             else:
                 ln['text'], ln['conf'], ln['edited'] = ev['text'], None, ev['source']
             ln['kind'] = line_kind(ln['text'])   # 고친 텍스트로 맞장구·간투사 다시 판별
+            ln['rev'] = ln.get('rev', 0) + 1
+            SENDER.edit(ln['id'], ln['rev'], text=ln['text'], kind=ln['kind'])
             ev = {'type': 'edit', 'id': ev['id'], 'text': ln['text'], 'conf': ln['conf'],
                   'edited': ln.get('edited'), 'orig': ln['orig'], 'kind': ln['kind']}
+        elif ev['type'] == 'delete':  # 사용자가 줄을 지움. 파일에는 deleted로 남기고 화면·요약 쪽에서는 뺌
+            ln = lines.get(ev['id'])
+            if not ln or ln.get('deleted'): return
+            ln['deleted'] = True; ln['rev'] = ln.get('rev', 0) + 1
+            SENDER.edit(ln['id'], ln['rev'], deleted=True)
         else:
             lines[ev['id']] = ev
             if partial and partial['id'] == ev['id']: partial = None
+            if ev['type'] in ('final', 'recovered', 'manual'): SENDER.line(ev)
         for q in clients: q.put(ev)
         if ev['type'] not in ('partial', 'status'): save_session()
 
@@ -106,15 +140,17 @@ def new_session(t0, path=None):
     os.makedirs(A.save_dir, exist_ok=True)
     base = path or os.path.join(A.save_dir, datetime.datetime.now().strftime('%Y%m%d_%H%M%S') + '.jsonl')
     os.makedirs(os.path.dirname(os.path.abspath(base)), exist_ok=True)
-    SESS = {'file': base, 'wav_path': None, 'wav': None, 'wav_t0': None, 't0': round(t0, 2),
+    mid = (A.meeting_id if A.meeting_id and SESS is None else '') or 'm_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    SESS = {'file': base, 'wav_path': None, 'wav': None, 'wav_t0': None, 't0': round(t0, 2), 'meeting_id': mid,
             'started': datetime.datetime.now().isoformat(timespec='seconds'), 'complete': False}
+    SENDER.start(mid, t0, os.path.splitext(base)[0] + '.outbox.jsonl')
     status['session'] = os.path.basename(base); status['rec'] = False; status['rec_sec'] = 0.0
 
 
 def save_session():
     """지금 세션의 줄을 파일에 통째로 다시 씀 (lock 안에서 호출). 첫 줄은 _meta"""
     if not SESS: return
-    meta = {k: SESS[k] for k in ('started', 't0', 'wav_t0', 'complete')}
+    meta = {k: SESS[k] for k in ('meeting_id', 'started', 't0', 'wav_t0', 'complete')}
     meta.update(source=status['source'], wav=SESS['wav_path'] and os.path.basename(SESS['wav_path']),
                 note='start·end는 서버 시작 뒤 엔진에 넣은 소리 기준 초. wav 안의 시각 = start - wav_t0')
     tmp = SESS['file'] + '.tmp'
@@ -122,7 +158,7 @@ def save_session():
         f.write(json.dumps({'_meta': meta}, ensure_ascii=False) + '\n')
         for ev in sorted(lines.values(), key=lambda e: e['start']):
             f.write(json.dumps({k: ev.get(k) for k in ('id', 'start', 'end', 'spk', 'spk_info', 'text', 'type', 'kind', 'conf',
-                                                       'alts', 'edited', 'orig', 'orig_conf', 'merged_from')},
+                                                       'alts', 'edited', 'orig', 'orig_conf', 'merged_from', 'rev', 'deleted')},
                                ensure_ascii=False) + '\n')
     os.replace(tmp, SESS['file'])   # 쓰는 도중 꺼져도 이전 파일은 남음
 
@@ -146,7 +182,7 @@ def control(eng, act):
         status['audio_sec'] = round(eng.fed, 1)
     if act == 'record' and st == 'idle':      # 새 세션: 화면을 비우고 새 파일로
         with lock: new_session(eng.fed)   # 먼저 새 세션으로 바꿔야 아래 clear가 닫은 세션 파일을 비우지 않음
-        publish({'type': 'clear'})
+        publish({'type': 'clear', 'session_switch': True})
         st = status['state'] = 'run'
     if act == 'record' and st in ('run', 'pause') and not SESS['wav']:
         a0 = max(SESS['t0'], eng.fed - 120); pre = eng._audio(a0, eng.fed) if eng.fed > a0 else np.zeros(0, np.float32)
@@ -155,12 +191,12 @@ def control(eng, act):
         SESS['wav'] = w; SESS['wav_t0'] = round(eng.fed - len(pre) / SR, 2); status['rec'] = True; status['rec_sec'] = 0.0
         rec_write(pre)
     elif act == 'pause' and st == 'run':
-        flush(); status['state'] = 'pause'
+        flush(); status['state'] = 'pause'; SENDER.event('pause')
     elif act == 'resume' and st == 'pause':
-        status['state'] = 'run'
+        status['state'] = 'run'; SENDER.event('resume')
     elif act == 'complete' and st in ('run', 'pause'):
         if st == 'run': flush()
-        rec_close(); status['state'] = 'idle'; status['rec'] = False
+        rec_close(); status['state'] = 'idle'; status['rec'] = False; SENDER.event('end')
         with lock: SESS['complete'] = True; save_session()
     else:
         return
@@ -187,7 +223,8 @@ def _audio_loop():
     global proc, ENGINE
     eng = ENGINE = Engine(publish, max_speakers=A.max_speakers, model_dir=f'{A.models}/zipformer-174m', vad_model=f'{A.models}/speaker/silero_vad.onnx',
                  chunk=A.chunk, hotwords=A.hotwords, hotwords_score=A.hotwords_score, recover=not A.no_recover,
-                 spk_model=f'{A.models}/speaker/nemo_en_titanet_small.onnx', diar=not A.no_diar, alt=not A.no_alt)
+                 spk_model=f'{A.models}/speaker/nemo_en_titanet_small.onnx', diar=not A.no_diar, alt=not A.no_alt,
+                 max_len=A.max_len, overlap=A.overlap)
     if A.wav:
         w = wave.open(A.wav); assert w.getframerate() == SR and w.getnchannels() == 1 and w.getsampwidth() == 2
         read = lambda: w.readframes(1600)
@@ -239,7 +276,8 @@ class H(BaseHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-cache'); self.end_headers()
             q = queue.Queue()
             with lock:
-                hist = sorted(lines.values(), key=lambda e: e['start']) + ([partial] if partial else [])
+                hist = sorted((e for e in lines.values() if not e.get('deleted')), key=lambda e: e['start']) + ([partial] if partial else [])
+                hist.append({'type': 'send_init', 'history': list(SENDER.history), 'snap': SENDER.snapshot()})
                 clients.append(q)
             try:
                 self.wfile.write(f"event: hello\ndata: {json.dumps(status, ensure_ascii=False)}\n\n".encode())
@@ -294,6 +332,16 @@ class H(BaseHTTPRequestHandler):
             if not d or d.get('action') not in ('record', 'pause', 'resume', 'complete'):
                 self.send_response(400); self.end_headers(); return
             CTRL.put(d['action']); self.send_response(204); self.end_headers()
+        elif self.path == '/delete' and self.headers.get('X-Meetingnote') == 'delete':
+            d = self._json()
+            try: i = int(d['id'])
+            except (TypeError, KeyError, ValueError):
+                self.send_response(400); self.end_headers(); return
+            with lock: ok = i in lines and not lines[i].get('deleted')
+            if not ok:
+                self.send_response(404); self.end_headers(); return
+            publish({'type': 'delete', 'id': i})
+            self.send_response(204); self.end_headers()
         elif self.path == '/add' and self.headers.get('X-Meetingnote') == 'add':
             # STT가 아예 못 잡은 말을 사용자가 직접 추가. 시각은 화면이 정한 위치(앞뒤 줄 사이)의 근사치
             global manual_seq
@@ -335,6 +383,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # 정리(마이크 끄기·저장)는 최대 약 10초. 그 사이 Ctrl+C를 또 누르면 저장이 끊기므로 무시함 (강제 종료는 Ctrl+\)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        print('\n끄는 중… 녹음·전사 파일을 저장하고 있으니 잠시 기다려 주세요 (최대 약 10초)', flush=True)
         stop.set()
         if proc and proc.poll() is None:  # 이 프로그램이 띄운 ffmpeg만 종료: 먼저 정상 종료('q'), 안 되면 신호
             try:
@@ -349,6 +400,7 @@ def main():
         th.join(timeout=5)
         with lock:
             rec_close()
+            if SESS and not SESS['complete']: SENDER.event('end')   # 완료를 누르지 않고 끈 경우
             if SESS:
                 save_session(); print(f'전사문 저장: {SESS["file"]}' + (f'  녹음: {SESS["wav_path"]}' if SESS['wav_path'] else ''))
         srv.server_close()
