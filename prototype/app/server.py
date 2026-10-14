@@ -1,11 +1,14 @@
 """회의 실시간 전사 웹 화면 (로컬 전용).
 
-마이크(ffmpeg avfoundation) 또는 wav를 엔진에 넣고, 이벤트를 SSE로 브라우저에 보냄.
+마이크 또는 wav를 엔진에 넣고, 이벤트를 SSE로 브라우저에 보냄.
 http://localhost:8765 에서 열림. 외부로 보내지 않음. 녹음은 저장하지 않음.
+마이크 입력: 기본은 sounddevice(CoreAudio). ffmpeg avfoundation 입력은 말할 때 틱 잡음이 생겨(맥 내장 마이크, 2026-10-14
+  진 청취) --input ffmpeg 일 때만 씀. 같은 날 서버 세션들에서 실제 시간 대비 소리가 약 11% 빠졌음 (원인 확인용 --diag)
 
 실행 (nineouting-stt/prototype 기준)
   마이크 장치 목록:  .venv/bin/python app/server.py --list-devices
-  마이크로 전사:     .venv/bin/python app/server.py --device 0
+  마이크로 전사:     .venv/bin/python app/server.py            (시스템 기본 입력. 장치를 고르려면 --device 번호)
+  입력 상태 진단:    .venv/bin/python app/server.py --diag     (30초마다 받은 소리·읽기 대기·처리 시간을 터미널에 출력)
   wav로 시험:       .venv/bin/python app/server.py --wav ~/Dev/nineouting-ref/stt_eval/own/eval_own_01.wav
   전사문 저장:       자동. 세션마다 transcripts/날짜_시각.jsonl 에 줄이 바뀔 때마다 저장 (--save-dir로 폴더, --out으로 첫 세션 파일 지정)
 종료: Ctrl+C (이 프로그램이 띄운 ffmpeg만 종료)
@@ -31,7 +34,10 @@ from summary_sender import Sender  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 p = argparse.ArgumentParser()
-p.add_argument('--device', default='0'); p.add_argument('--list-devices', action='store_true')
+p.add_argument('--input', default='sd', choices=['sd', 'ffmpeg'], help='마이크 입력 방식 (sd=sounddevice/CoreAudio, ffmpeg=avfoundation)')
+p.add_argument('--device', default='', help='마이크 장치 번호 (--list-devices). 없으면 sd는 시스템 기본 입력, ffmpeg는 0')
+p.add_argument('--list-devices', action='store_true')
+p.add_argument('--diag', action='store_true', help='30초마다 입력 상태(실제 시간 대비 받은 소리, 읽기 대기, 처리 시간)를 터미널에 출력')
 p.add_argument('--wav', default=''); p.add_argument('--port', type=int, default=8765)
 p.add_argument('--models', default=DEFAULT_MODELS, help='stt_models 폴더 (기본: nineouting-ref/stt_models)')
 p.add_argument('--chunk', default='64', choices=['16', '64'])
@@ -50,6 +56,12 @@ p.add_argument('--meeting-id', default='', help='첫 회의의 meeting_id (앱�
 A = p.parse_args()
 
 FFMPEG = shutil.which('ffmpeg')
+if A.list_devices and A.input == 'sd':
+    import sounddevice as sd
+    for i, d in enumerate(sd.query_devices()):
+        if d['max_input_channels'] > 0:
+            print(f'[{i}] {d["name"]} (입력 {d["max_input_channels"]}채널, {d["default_samplerate"]:.0f}Hz)' + (' ← 기본' if i == sd.default.device[0] else ''))
+    sys.exit(0)
 if A.list_devices:
     if not FFMPEG: sys.exit('ffmpeg를 찾지 못함')
     r = subprocess.run([FFMPEG, '-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''], capture_output=True, text=True)
@@ -60,7 +72,7 @@ lock = threading.RLock()   # 요약 전송 알림이 publish 안에서 다시 pu
 lines = {}          # id → 확정·보완 줄 (새로 접속한 화면에 보냄)
 partial = None      # 지금 말하는 중인 줄
 clients = []        # 화면별 큐
-status = {'source': A.wav or f'마이크 {A.device}', 'audio_sec': 0.0, 'running': True, 'max_speakers': A.max_speakers,
+status = {'source': A.wav or f'마이크 {A.device or "기본"} ({A.input})', 'audio_sec': 0.0, 'running': True, 'max_speakers': A.max_speakers,
           'state': 'run', 'rec': False, 'rec_sec': 0.0, 'session': ''}   # state: run(전사 중) / pause(일시정지) / idle(완료 후 대기)
 ENGINE = None       # 화면에서 화자 합치기·참석자 수를 바꿀 때 씀
 manual_seq = 0      # 직접 추가한 줄 번호
@@ -219,45 +231,102 @@ def audio_loop():
         publish({'type': 'status', 'running': False, 'error': str(e)})
 
 
+class Diag:
+    """--diag: 소리 입력 스레드가 시간을 어디에 쓰는지 30초마다 출력 (멈춘 동안은 세지 않음)"""
+    def __init__(self, q=None, flags=None):
+        self.q, self.flags = q, flags or {}
+        self.last = self.t_rep = time.perf_counter(); self.n_err = 0
+        self.wall = self.got = self.read = self.feed = self.pub = self.rec = 0.0; self.n = self.instant = 0; self.maxq = 0
+
+    def tick(self, running):
+        now = time.perf_counter()
+        if running: self.wall += now - self.last
+        self.last = now
+        if self.q is not None: self.maxq = max(self.maxq, self.q.qsize())
+        if now - self.t_rep >= 30 and self.wall > 0:
+            self.t_rep = now
+            lost = (1 - self.got / self.wall) * 100
+            msg = (f'[진단] 실행 {self.wall:.0f}초 · 받은 소리 {self.got:.0f}초 (빠짐 {lost:.1f}%) · 읽기 대기 {self.read:.1f}초 '
+                   f'(바로 읽힘 {self.instant / max(self.n, 1) * 100:.0f}%) · 엔진 {self.feed - self.pub:.1f}초 · 알림·저장 {self.pub:.1f}초 · 녹음 쓰기 {self.rec:.1f}초')
+            if self.q is not None: msg += f' · 대기열 최대 {self.maxq * 0.1:.1f}초'
+            if self.flags: msg += ' · ' + ', '.join(f'{k} {v}' for k, v in self.flags.items())
+            new = ffmpeg_err[self.n_err:]; self.n_err = len(ffmpeg_err)
+            if new: msg += ' · ffmpeg: ' + ' / '.join(new[-3:])
+            print(msg, file=sys.stderr, flush=True)
+
+
 def _audio_loop():
     global proc, ENGINE
     eng = ENGINE = Engine(publish, max_speakers=A.max_speakers, model_dir=f'{A.models}/zipformer-174m', vad_model=f'{A.models}/speaker/silero_vad.onnx',
                  chunk=A.chunk, hotwords=A.hotwords, hotwords_score=A.hotwords_score, recover=not A.no_recover,
                  spk_model=f'{A.models}/speaker/nemo_en_titanet_small.onnx', diar=not A.no_diar, alt=not A.no_alt,
                  max_len=A.max_len, overlap=A.overlap)
+    stream = None; sdq = None; flags = {}
     if A.wav:
         w = wave.open(A.wav); assert w.getframerate() == SR and w.getnchannels() == 1 and w.getsampwidth() == 2
         read = lambda: w.readframes(1600)
+    elif A.input == 'sd':
+        # CoreAudio가 자기 스레드에서 0.1초 조각을 대기열에 넣음 → 처리가 잠깐 늦어도 입력이 버려지지 않음
+        import sounddevice as sd
+        dev = int(A.device) if A.device.isdigit() else (A.device or None)
+        sdq = queue.Queue(); flags = {'입력 넘침': 0}
+        def cb(data, frames, t, st):
+            if st.input_overflow: flags['입력 넘침'] += 1
+            sdq.put(bytes(data))
+        stream = sd.RawInputStream(samplerate=SR, channels=1, dtype='int16', blocksize=1600, device=dev, callback=cb)
+        status['source'] = f'마이크 {sd.query_devices(stream.device)["name"]}'
+        stream.start()
+        def read():
+            while not stop.is_set():
+                try: return sdq.get(timeout=0.5)
+                except queue.Empty:
+                    if not stream.active: raise RuntimeError('마이크 입력이 멈춤 (장치 연결을 확인)')
+            return b''
     else:
         # 별도 프로세스 그룹: 터미널 Ctrl+C가 ffmpeg에 직접 가지 않고, 서버가 정상 종료('q')시킴
-        proc = subprocess.Popen([FFMPEG, '-hide_banner', '-loglevel', 'error', '-f', 'avfoundation', '-i', f':{A.device}',
-                                 '-ac', '1', '-ar', str(SR), '-f', 's16le', '-'],
+        proc = subprocess.Popen([FFMPEG, '-hide_banner', '-loglevel', 'warning' if A.diag else 'error', '-f', 'avfoundation',
+                                 '-i', f':{A.device or 0}', '-ac', '1', '-ar', str(SR), '-f', 's16le', '-'],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         threading.Thread(target=lambda: ffmpeg_err.extend(l.decode(errors='replace').rstrip() for l in proc.stderr),
                          daemon=True).start()
         read = lambda: proc.stdout.read(3200)
+    D = Diag(sdq, flags) if A.diag else None
+    if D:   # 엔진이 부르는 화면 알림·파일 저장 시간을 따로 셈 (다른 결과 스레드의 알림은 세지 않음)
+        def timed(ev, _p=publish):
+            t = time.perf_counter(); _p(ev); D.pub += time.perf_counter() - t
+        eng.on_event = timed
     with lock: new_session(0.0, A.out or None); save_session()
     t0 = time.perf_counter(); fed = 0.0
-    while not stop.is_set():
-        while not CTRL.empty():
-            was = status['state']; control(eng, CTRL.get())
-            if was != 'run' and status['state'] == 'run': t0 = time.perf_counter() - fed   # wav 입력: 실제 속도 기준을 다시 맞춤
-        if A.wav and status['state'] != 'run':   # 파일 입력은 멈춘 동안 읽지 않음 (위치 유지)
-            time.sleep(0.1); continue
-        b = read()
-        if not b:
-            if proc and not stop.is_set():  # 서버가 끄지 않았는데 ffmpeg가 멈춤 → 원인 메시지를 보여줌
-                time.sleep(0.2)
-                msg = ' / '.join(ffmpeg_err[-3:]) or f'ffmpeg 종료 (코드 {proc.poll()})'
-                raise RuntimeError(f'마이크 입력이 멈춤: {msg}')
-            break
-        c = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768
-        if A.wav:  # 실제 속도로
-            d = fed + len(c) / SR - (time.perf_counter() - t0)
-            if d > 0: time.sleep(d)
-        if status['state'] != 'run':   # 마이크 입력은 멈춘 동안 읽어서 버림
-            continue
-        eng.feed(c); rec_write(c); fed += len(c) / SR; status['audio_sec'] = round(eng.fed, 1)
+    try:
+        while not stop.is_set():
+            if D: D.tick(status['state'] == 'run')
+            while not CTRL.empty():
+                was = status['state']; control(eng, CTRL.get())
+                if was != 'run' and status['state'] == 'run': t0 = time.perf_counter() - fed   # wav 입력: 실제 속도 기준을 다시 맞춤
+            if A.wav and status['state'] != 'run':   # 파일 입력은 멈춘 동안 읽지 않음 (위치 유지)
+                time.sleep(0.1); continue
+            tr = time.perf_counter(); b = read()
+            if not b:
+                if proc and not stop.is_set():  # 서버가 끄지 않았는데 ffmpeg가 멈춤 → 원인 메시지를 보여줌
+                    time.sleep(0.2)
+                    msg = ' / '.join(ffmpeg_err[-3:]) or f'ffmpeg 종료 (코드 {proc.poll()})'
+                    raise RuntimeError(f'마이크 입력이 멈춤: {msg}')
+                break
+            c = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768
+            if A.wav:  # 실제 속도로
+                d = fed + len(c) / SR - (time.perf_counter() - t0)
+                if d > 0: time.sleep(d)
+            if status['state'] != 'run':   # 마이크 입력은 멈춘 동안 읽어서 버림
+                continue
+            if D:
+                dt = time.perf_counter() - tr; D.read += dt; D.n += 1; D.instant += dt < 0.001
+                tf = time.perf_counter(); eng.feed(c); D.feed += time.perf_counter() - tf
+                tw = time.perf_counter(); rec_write(c); D.rec += time.perf_counter() - tw; D.got += len(c) / SR
+            else:
+                eng.feed(c); rec_write(c)
+            fed += len(c) / SR; status['audio_sec'] = round(eng.fed, 1)
+    finally:
+        if stream: stream.stop(); stream.close()
     eng.finish(); status['running'] = False
     publish({'type': 'status', 'running': False})
 

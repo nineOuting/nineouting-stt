@@ -35,12 +35,14 @@
 ```bash
 cd ~/Dev/nineouting-stt/prototype
 .venv/bin/python app/server.py --list-devices      # 마이크 장치 번호 확인
-.venv/bin/python app/server.py --device 0          # 마이크로 전사 → http://localhost:8765
+.venv/bin/python app/server.py                     # 기본 마이크로 전사 → http://localhost:8765
 ```
 
 | 옵션 | 내용 |
 |---|---|
-| `--device N` | 마이크 장치 번호 (avfoundation) |
+| `--device N` | 마이크 장치 번호 (`--list-devices`). 없으면 시스템 기본 입력 |
+| `--input ffmpeg` | 마이크를 ffmpeg(avfoundation)로 받음. 기본은 sounddevice(CoreAudio). ffmpeg 입력은 말할 때 틱 잡음이 생김 (아래 참고) |
+| `--diag` | 30초마다 입력 상태를 터미널에 출력: 실제 시간 대비 받은 소리(빠진 비율), 읽기 대기, 엔진·알림·저장·녹음 쓰기 시간, 대기열 최대, 입력 넘침 |
 | `--wav 파일` | 마이크 대신 wav(16kHz 모노 16bit)를 실제 속도로 입력 (시험용) |
 | `--summary-url 주소` | 요약 쪽 받는 주소 (JSON POST). 없으면 outbox 파일에만 기록 |
 | `--send-period 초` | 요약 쪽 전송 주기. 기본 10 |
@@ -58,7 +60,7 @@ cd ~/Dev/nineouting-stt/prototype
 
 - 종료: Ctrl+C
 - 처음 마이크로 실행하면 macOS가 터미널 앱의 마이크 접근 허용을 물을 수 있음 (시스템 설정 → 개인정보 보호 및 보안 → 마이크)
-- 마이크 입력은 PATH의 ffmpeg(avfoundation)를 씀
+- 마이크 입력은 sounddevice(PortAudio → CoreAudio). CoreAudio가 자기 스레드에서 0.1초 조각을 대기열에 넣어, 처리가 잠깐 늦어도 입력이 버려지지 않음. `--input ffmpeg`일 때만 PATH의 ffmpeg를 씀
 
 ## 설치
 
@@ -100,7 +102,10 @@ nineouting-ref/stt_eval/meeting2/ 의 실험 문서
 - wav(회의 1 평가 구간)를 실제 속도로 넣어 화면 동작 확인함 (2026-10-13): 타이핑, 확정, 보완 줄 제자리 끼우기, 콘솔 오류 없음
 - 요약 쪽 전송을 wav 입력과 시험용 받는 서버로 확인함 (2026-10-14, 주기 5초로 줄여 시험): 보낸 11개와 받은 11개가 같음, 보완 줄이 앞 시각으로 늦게 옴, 같은 주기 안에서 두 번 고치면 `rev` 2만 감, 보내기 전에 지운 줄은 묶음에서 빠짐, 멈춤·재개·끝 알림. 실제 요약 쪽 FastAPI와는 아직 연결 안 함
 - 세션 버튼을 wav 입력으로 확인함 (2026-10-13): 녹음 시작(직전 18초 포함), 일시정지·계속, 완료, 새 세션, 완료 뒤 고치기가 각 파일에 저장됨. 줄 시각 - `wav_t0` 위치에 실제 말소리가 있음 (구간 RMS로 확인). 마이크 입력으로는 확인하지 않음
-- 실제 마이크 입력은 확인하지 않음. miniconda ffmpeg의 avfoundation 지원도 확인하지 않음
+- 마이크 입력 문제 (2026-10-14, 맥 내장 마이크)
+  - ffmpeg avfoundation으로 받으면 말할 때마다 틱 잡음 (16kHz 변환·원래 형식 모두). 같은 마이크를 음성 메모·sounddevice로 받으면 깨끗함 (진 청취) → 기본 입력을 sounddevice로 바꿈
+  - ffmpeg 입력 서버 세션들에서 실제 시간 대비 엔진에 들어간 소리가 약 11% 짧았음 (outbox 알림 시각 vs at_ms). ffmpeg 단독(파일·파이프)은 60초 녹음에 60.3초로 정상이고, 녹음 재생으로 잰 엔진 처리는 실시간의 0.07배 → 서버 안 원인은 미확정. sounddevice 입력에서 사라지는지 `--diag`로 확인 예정
+  - 측정 스크립트: nineouting-ref `stt_eval/meeting2/review/live_1014/` (audio_check.py, feed_timing.py, session_drift.py)
 - 화자 번호·보완 목록 패널·"최신으로" 버튼·휴대폰 폭(375px) 화면을 wav로 확인함 (2026-10-13). 화자 번호의 정확도는 재지 않음
 - 짧은 대답(2초 미만)은 새 사람이어도 기존 화자 중 가장 가까운 사람으로 붙음 (설정 E의 부작용)
 - 한 줄 안에서 화자가 바뀌면 한 사람으로 처리됨
