@@ -49,7 +49,7 @@ cd ~/Dev/nineouting-stt/prototype
 | `--meeting-id 값` | 첫 회의의 `meeting_id` (앱이 줄 값). 없으면 `m_날짜_시각` |
 | `--save-dir 폴더` | 세션 전사·녹음 파일 폴더. 기본 `prototype/transcripts` |
 | `--out 파일.jsonl` | 첫 세션의 전사 파일 경로 지정 (기본은 자동 이름). 줄이 바뀔 때마다 저장 |
-| `--hotwords 파일 --hotwords-score 1.0` | 핫워드 (회의 용어). 흔한 말로 시작하는 단어는 넣지 않음 |
+| `--hotwords 파일 --hotwords-score 1.0` | 핫워드 (회의 용어). 기본 `app/hotwords.txt`(31개), 끄려면 `--hotwords ''`. 흔한 말로 시작하는 단어나 짧은 말(디비 등)은 넣지 않음 (아래 설정 근거) |
 | `--blank-penalty 0.5` | 글자 안 냄(blank)에 주는 벌점. 기본 0.5. 빠지는 말이 줄고 틀린·낀 글자가 조금 늚. 0이면 끔 (아래 설정 근거) |
 | `--chunk 16` | 글자가 더 자주 나옴(약 0.3초 단위) 대신 정확도 낮음. 기본 64 |
 | `--no-recover` | VAD 보완 끄기 |
@@ -94,6 +94,13 @@ STT 모델 출처: [kangkyu/icefall-asr-ko-streaming-zipformer-174m](https://hug
 
 nineouting-ref/stt_eval/meeting2/ 의 실험 문서
 - `stt_improve.md` (SCRUM-23): chunk-64, 후보 4, 핫워드 21개·가산점 1.0 추천
+- 핫워드 기본 31개 (`app/hotwords.txt`, 2026-10-15, nineouting-ref `review/hotword_v3/`, 측정값)
+  - 구성: 회의 2 오인식에서 뽑은 21개(SCRUM-23) + 10-13 실제 회의 오류에서 뽑은 기술 용어 10개(벡터디비, 피알디, 엘엘엠 등)
+  - blank penalty 0.5와 함께: 회의 1 19.8%(109·49·30), 회의 2 5.6%(70·25·41). 핫워드 없음은 19.8%·5.7%
+  - 정답에 나온 용어 15번 중 맞힘 5 → 9번, 정답에 없는 곳에 용어를 끼워 넣은 경우 0
+  - 뺀 단어: 디비·레그(짧아서 다른 말을 끌어옴), 백엔드·전사문·정리본·요약본·회의록(흔한 말로 시작). 넣으면 회의 2 삭제 42 → 51자
+  - 새 기술 용어 10개는 평가 녹음에 나오지 않아 효과는 미측정. 다른 팀 회의에는 맞지 않을 수 있음 (회의마다 목록을 바꾸는 것은 정식 서버에서)
+  - 파일은 한 줄에 단어 하나, 주석 넣지 않음 (sherpa-onnx 핫워드 파일 형식)
 - blank penalty (2026-10-14, `review/decode_opts/`, 최대 10초 + 1초·중복 거르기 기준, 측정값)
 
   | blank penalty | 회의 1 CER · 대체·삭제·삽입 | 회의 2 CER · 대체·삭제·삽입 |

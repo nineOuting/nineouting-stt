@@ -42,7 +42,9 @@ p.add_argument('--diag', action='store_true', help='30초마다 입력 상태(�
 p.add_argument('--wav', default=''); p.add_argument('--port', type=int, default=8765)
 p.add_argument('--models', default=DEFAULT_MODELS, help='stt_models 폴더 (기본: nineouting-ref/stt_models)')
 p.add_argument('--chunk', default='64', choices=['16', '64'])
-p.add_argument('--hotwords', default=''); p.add_argument('--hotwords-score', type=float, default=1.0)
+p.add_argument('--hotwords', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hotwords.txt'),
+               help="핫워드(회의 용어) 파일. 기본 app/hotwords.txt 31개. 끄려면 --hotwords ''")
+p.add_argument('--hotwords-score', type=float, default=1.0)
 p.add_argument('--blank-penalty', type=float, default=0.5, help='글자 안 냄(blank)에 주는 벌점. 빠지는 말이 줄고 틀린·낀 글자가 조금 늚. 0이면 끔 (1.0부터 삽입 급증)')
 p.add_argument('--no-recover', action='store_true'); p.add_argument('--out', default='', help='첫 세션 전사 파일 경로 (기본: 자동 이름)')
 p.add_argument('--save-dir', default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'transcripts'),
