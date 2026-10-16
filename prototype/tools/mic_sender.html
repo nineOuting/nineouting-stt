@@ -1,0 +1,178 @@
+<!doctype html>
+<!--
+시험용 보내는 화면: 브라우저 마이크 → 16kHz 모노 16비트 PCM 100ms 조각 → WebSocket → STT 서버(--input ws).
+실제 FE가 아님. FE를 만들 때 참고하고, 브라우저 음성 처리(에코 제거·잡음 억제·자동 음량)에 따른 인식률 차이를 재는 데 씀.
+- 16kHz 변환은 브라우저 자체 변환을 씀 (AudioContext를 16kHz로 만듦). 표본을 직접 솎으면 음질이 망가짐
+- Chrome·Safari에서 확인. Firefox는 마이크와 다른 표본 주파수의 AudioContext 연결을 막는 경우가 있음
+- "끊고 다시 붙기": 연결을 끊은 동안 소리를 모아 두었다가, 다시 연결해 start(offsetMs)로 이어서 몰아 보냄 (장애 뒤 몰아 보내기 시험)
+- 아래 자막: 가짜 백엔드(tools/mock_backend.py)가 2.2 규칙으로 합친 자막을 구독해 보여줌. 실서비스의 작성자 화면처럼
+  "보내기 → STT → 백엔드 → 자막"을 한 화면에서 봄. 가짜 백엔드는 SSE로 내려주지만 실제 백엔드는 WebSocket 예정 (합치는 규칙은 같음)
+열기: STT 서버를 --input ws로 켜고 http://localhost:8765/sender
+-->
+<html lang="ko"><head><meta charset="utf-8"><title>시험용 보내는 화면</title>
+<style>
+body{font-family:-apple-system,"Apple SD Gothic Neo",sans-serif;max-width:720px;margin:24px auto;padding:0 16px;color:#222}
+label{display:block;margin:6px 0}input[type=text]{width:320px;padding:4px}button{font-size:14px;padding:6px 12px;margin:4px 4px 4px 0}
+#meter{height:10px;background:#eee;border-radius:5px;overflow:hidden;margin:10px 0}#bar{height:100%;width:0;background:#4a8}
+#stat{font-variant-numeric:tabular-nums;color:#444}#log{font-size:12px;background:#fafafa;border:1px solid #eee;height:140px;overflow:auto;padding:6px;white-space:pre-wrap}
+#subs{border:1px solid #ddd;height:300px;overflow:auto;padding:6px 10px}.row{display:flex;gap:10px;padding:4px 0;border-bottom:1px solid #f3f3f3;transition:background 1.5s}
+.ts{color:#999;font-size:12px;min-width:48px;font-variant-numeric:tabular-nums}.partial .tx{color:#999;font-style:italic}.rec{background:#fff3b0}
+.tag{font-size:11px;padding:0 5px;border-radius:3px;margin-left:6px;background:#ffe27a}.low{border-bottom:1px dotted #c00}
+.body{flex:1}.lat{font-size:11px;color:#888;margin-top:2px;font-variant-numeric:tabular-nums}#latsum{font-size:13px;color:#333;margin:4px 0;font-variant-numeric:tabular-nums}
+fieldset{border:1px solid #ddd;margin:10px 0}
+</style></head><body>
+<h2>시험용 보내는 화면 (마이크 → STT WebSocket)</h2>
+<label>STT WebSocket <input type="text" id="url"></label>
+<label>meetingId <input type="text" id="mid"></label>
+<fieldset><legend>브라우저 음성 처리 (기본 모두 끔)</legend>
+<label><input type="checkbox" id="ec"> 에코 제거 (echoCancellation)</label>
+<label><input type="checkbox" id="ns"> 잡음 억제 (noiseSuppression)</label>
+<label><input type="checkbox" id="agc"> 자동 음량 (autoGainControl)</label>
+</fieldset>
+<button id="bStart">시작</button><button id="bPause" disabled>멈춤</button><button id="bResume" disabled>재개</button>
+<button id="bEnd" disabled>종료</button><button id="bDrop" disabled>끊고 3초 뒤 다시 붙기</button>
+<div id="meter"><div id="bar"></div></div>
+<div id="stat">대기</div>
+<h3>자막 (가짜 백엔드에서 받음) <small><input type="text" id="burl" style="width:200px"> <span id="bst" style="color:#999"></span></small></h3>
+<div style="color:#888;font-size:12px;margin-bottom:4px">회색 기울임 = 말하는 중 · 노란색·"보완" = 나중에 끼워진 줄 · 점선 = 인식 불확실 · 시각 = 회의 시간<br>
+입력 = 그 말을 마이크로 받은 실제 시각 · 첫 표시 = 자막에 처음 나온 시각(말 시작부터) · 확정 = 확정된 시각(말 끝부터). 경로: 브라우저 → STT → 백엔드(0.5초 주기) → 자막</div>
+<div id="latsum">지연: 아직 없음</div>
+<div id="subs"></div>
+<h3>기록</h3><div id="log"></div>
+<script>
+const $ = id => document.getElementById(id);
+$('url').value = `ws://${location.hostname || 'localhost'}:8770`;
+$('mid').value = 'm_' + new Date().toISOString().replace(/\D/g, '').slice(0, 14);
+const log = s => { $('log').textContent += new Date().toLocaleTimeString() + '  ' + s + '\n'; $('log').scrollTop = 1e9; };
+let ws = null, ctx = null, stream = null, node = null, paused = false, ended = true;
+let buf = new Int16Array(1600), bi = 0;     // 100ms 조각을 채우는 중
+let sentMs = 0;                              // 회의 시작 기준으로 만든 소리 길이 (멈춘 동안은 늘지 않음)
+let backlog = [];                            // 끊긴 동안 모은 조각 [시작 ms, ArrayBuffer]
+let chunkWall = [];                          // 지연 측정용: 회의 시각 100ms 조각 i를 다 받은 실제 시각(Date.now)
+let chunks = 0, holding = false;             // holding: 다시 연결해 모아 둔 조각을 다 보낼 때까지 새 조각도 뒤에 붙임 (순서 유지)
+
+function stat() { $('stat').textContent = `${ws && ws.readyState === 1 ? '연결됨' : '끊김'} · ${paused ? '멈춤' : ended ? '끝' : '보내는 중'} · 만든 소리 ${(sentMs / 1000).toFixed(1)}초 · 보낸 조각 ${chunks} · 모아 둔 조각 ${backlog.length}`; }
+function sendChunk(ms, ab) {
+  if (ws && ws.readyState === 1 && !holding) { ws.send(ab); chunks++; } else backlog.push([ms, ab]);
+}
+function connect(offsetMs) {
+  return new Promise((ok, fail) => {
+    ws = new WebSocket($('url').value); ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { ws.send(JSON.stringify({ type: 'start', meetingId: $('mid').value, offsetMs })); log(`연결, start offsetMs=${offsetMs}`); };
+    ws.onmessage = e => { const m = JSON.parse(e.data); log('서버: ' + e.data); if (m.type === 'ready') ok(m); };
+    ws.onclose = e => { log(`연결 닫힘 (code ${e.code}${e.reason ? ', ' + e.reason : ''})`); stat(); };
+    ws.onerror = () => { log('연결 오류'); fail(); };
+  });
+}
+async function start() {
+  stream = await navigator.mediaDevices.getUserMedia({ audio: {
+    channelCount: 1, echoCancellation: $('ec').checked, noiseSuppression: $('ns').checked, autoGainControl: $('agc').checked } });
+  const tr = stream.getAudioTracks()[0]; log(`마이크: ${tr.label} · 설정 ${JSON.stringify(tr.getSettings())}`);
+  ctx = new AudioContext({ sampleRate: 16000 });   // 브라우저가 마이크 소리를 16kHz로 바꿔 줌
+  log(`AudioContext ${ctx.sampleRate}Hz`);
+  const code = `class P extends AudioWorkletProcessor { process(i) { if (i[0][0]) this.port.postMessage(i[0][0].slice(0)); return true; } }
+                registerProcessor('pcm', P);`;
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
+  node = new AudioWorkletNode(ctx, 'pcm');
+  node.port.onmessage = e => {
+    if (paused || ended) return;
+    const f = e.data; let peak = 0;
+    for (let k = 0; k < f.length; k++) {
+      const v = Math.max(-1, Math.min(1, f[k])); peak = Math.max(peak, Math.abs(v));
+      buf[bi++] = v < 0 ? v * 32768 : v * 32767;
+      if (bi === 1600) { chunkWall[sentMs / 100] = Date.now(); sendChunk(sentMs, buf.buffer.slice(0)); sentMs += 100; bi = 0; }
+    }
+    $('bar').style.width = Math.min(100, peak * 140) + '%';
+  };
+  ctx.createMediaStreamSource(stream).connect(node);
+  sentMs = 0; chunks = 0; backlog = []; bi = 0; paused = false; ended = false; chunkWall = []; seen = {};
+  await connect(0);
+  ['bPause', 'bEnd', 'bDrop'].forEach(b => $(b).disabled = false); $('bStart').disabled = true; stat();
+}
+$('bStart').onclick = () => start().catch(e => log('시작 실패: ' + e));
+$('bPause').onclick = () => { paused = true; bi = 0; ws.send(JSON.stringify({ type: 'pause' })); $('bPause').disabled = true; $('bResume').disabled = false; stat(); };
+$('bResume').onclick = () => { paused = false; ws.send(JSON.stringify({ type: 'resume' })); $('bPause').disabled = false; $('bResume').disabled = true; stat(); };
+$('bEnd').onclick = () => {
+  ended = true; if (bi) { sendChunk(sentMs, buf.buffer.slice(0, bi * 2)); sentMs += bi / 16; bi = 0; }
+  ws.send(JSON.stringify({ type: 'end' }));
+  setTimeout(() => { ws.close(); stream.getTracks().forEach(t => t.stop()); ctx.close(); }, 500);
+  ['bPause', 'bResume', 'bEnd', 'bDrop'].forEach(b => $(b).disabled = true); $('bStart').disabled = false; stat();
+};
+$('bDrop').onclick = () => {   // 장애 흉내: 끊은 동안 소리는 backlog에 쌓이고, 다시 붙으면 그 시작 시각부터 몰아 보냄
+  log('연결을 일부러 끊음'); holding = true; ws.onclose = null; ws.close(); stat();
+  setTimeout(async () => {
+    const from = backlog.length ? backlog[0][0] : sentMs;
+    await connect(from);
+    const n = backlog.length;
+    backlog.forEach(([ms, ab]) => { ws.send(ab); chunks++; }); backlog = []; holding = false;
+    log(`모아 둔 조각 ${n}개(${n / 10}초)를 몰아 보냄`); stat();
+  }, 3000);
+};
+setInterval(stat, 500);
+
+// ---- 자막: 가짜 백엔드의 자막 흐름을 구독 (실서비스에서는 백엔드가 WebSocket으로 내려줄 부분) ----
+$('burl').value = `http://${location.hostname || 'localhost'}:8767`;
+const M = {};   // meetingId → {seq: segment}
+const fmt = ms => { const s = ms / 1000; return String(Math.floor(s / 60)).padStart(2, '0') + ':' + (s % 60).toFixed(1).padStart(4, '0'); };
+// ---- 지연: 회의 시각 → 그 소리를 받은 실제 시각, 자막이 처음 나온·확정된 실제 시각 ----
+let seen = {};   // seq → {first, final} (이 화면이 받은 실제 시각)
+function wallAt(ms) {   // 회의 시각 ms의 소리를 마이크로 받은 실제 시각 (100ms 조각 안에서 비례)
+  const i = Math.floor(ms / 100), w = chunkWall[i];
+  return w == null ? null : w - (100 - (ms - i * 100));
+}
+const clock = t => { const d = new Date(t); return d.toTimeString().slice(0, 8) + '.' + String(Math.floor(d.getMilliseconds() / 100)); };
+const sec = x => (x / 1000).toFixed(1);
+function latLine(s) {
+  const z = seen[s.seq], a = wallAt(s.startMs), b = s.endMs != null ? wallAt(s.endMs) : null;
+  if (!z || a == null) return '';
+  let t = `입력 ${clock(a)}${b ? '~' + clock(b) : ''}`;
+  if (!s.recovered) t += ` · 첫 표시 ${clock(z.first)} (+${sec(z.first - a)}초)`;
+  if (z.final && b) t += ` · 확정 ${clock(z.final)} (+${sec(z.final - b)}초)`;
+  return `<div class="lat">${t}</div>`;
+}
+function stats(xs) { if (!xs.length) return '-'; const v = [...xs].sort((p, q) => p - q); return `중앙 ${sec(v[Math.floor(v.length / 2)])}초 · 최대 ${sec(v[v.length - 1])}초 (${v.length}줄)`; }
+function latSummary(seg) {
+  const first = [], fin = [], rec = [];
+  Object.values(seg).forEach(s => {
+    const z = seen[s.seq], a = wallAt(s.startMs), b = s.endMs != null ? wallAt(s.endMs) : null;
+    if (!z || a == null) return;
+    if (s.recovered) { if (z.final && b) rec.push(z.final - b); return; }
+    first.push(z.first - a); if (z.final && b) fin.push(z.final - b);
+  });
+  $('latsum').textContent = `첫 표시 지연 ${stats(first)}  |  확정 지연 ${stats(fin)}  |  보완 줄 (말 끝 → 표시) ${stats(rec)}`;
+}
+function renderSubs(flash) {
+  const box = $('subs'), seg = M[$('mid').value] || {};
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  box.innerHTML = Object.values(seg).sort((a, b) => a.startMs - b.startMs).map(s =>
+    `<div class="row ${s.final ? '' : 'partial'} ${flash && flash.has(s.seq) && s.recovered ? 'rec' : ''}"><span class="ts">${fmt(s.startMs)}</span>` +
+    `<div class="body"><span class="tx ${s.lowConfidence ? 'low' : ''}">${(s.text || '').replace(/</g, '&lt;')}</span>${s.recovered ? '<span class="tag">보완</span>' : ''}${latLine(s)}</div></div>`).join('');
+  if (flash) setTimeout(() => box.querySelectorAll('.rec').forEach(e => e.classList.remove('rec')), 1600);
+  if (atBottom) box.scrollTop = box.scrollHeight;
+  latSummary(seg);
+}
+let es = null;
+function subscribe() {
+  if (es) es.close();
+  es = new EventSource($('burl').value + '/events');
+  es.onopen = () => { $('bst').textContent = '연결됨'; };
+  es.onerror = () => { $('bst').textContent = '연결 안 됨 (가짜 백엔드가 켜져 있는지 확인)'; };
+  es.onmessage = x => {
+    const ev = JSON.parse(x.data);
+    if (ev.type === 'snap') { for (const [k, v] of Object.entries(ev.meetings)) { M[k] = {}; v.seg.forEach(s => M[k][s.seq] = s); } renderSubs(); }
+    else if (ev.type === 'req') {
+      const k = ev.entry.meeting; M[k] = M[k] || {};
+      const now = Date.now();
+      ev.changed.forEach(s => {
+        M[k][s.seq] = s;   // 가짜 백엔드가 이미 2.2 규칙(rev, 확정 보호)으로 걸러 바뀐 줄만 줌
+        if (k !== $('mid').value) return;
+        const z = seen[s.seq] = seen[s.seq] || { first: now, final: null };
+        if (s.final && !z.final) z.final = now;
+      });
+      if (k === $('mid').value) renderSubs(new Set(ev.changed.filter(s => s._new).map(s => s.seq)));
+    }
+  };
+}
+$('burl').onchange = subscribe; $('mid').oninput = () => renderSubs();
+subscribe();
+</script></body></html>

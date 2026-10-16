@@ -79,7 +79,9 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, PAGE.encode(), 'text/html; charset=utf-8')
         if self.path == '/events':
             self.protocol_version = 'HTTP/1.0'
-            self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.send_header('Cache-Control', 'no-cache'); self.end_headers()
+            self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Access-Control-Allow-Origin', '*')   # 다른 포트의 시험용 보내는 화면(/sender)도 자막을 구독할 수 있게 (시험용)
+            self.end_headers()
             q = queue.Queue()
             with lock:
                 snap = {'type': 'snap', 'meetings': {k: {'seg': list(v['seg'].values()), 'stats': v['stats']} for k, v in meetings.items()},
@@ -148,8 +150,18 @@ const es=new EventSource('/events');es.onmessage=x=>{const ev=JSON.parse(x.data)
   const t=setInterval(()=>{n--;b.textContent=n>0?`503으로 답하는 중 ${n}초`:'';if(n<=0)clearInterval(t)},1000)}};
 </script></body></html>"""
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        """유지하던 연결을 상대가 끊은 경우(STT 서버 종료, 화면 새로고침)는 정상이라 조용히 넘김. 다른 오류는 그대로 출력"""
+        import sys
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)): return
+        super().handle_error(request, client_address)
+
+
 if __name__ == '__main__':
-    srv = ThreadingHTTPServer(('127.0.0.1', A.port), H); srv.daemon_threads = True
+    srv = Server(('127.0.0.1', A.port), H)
     print(f'가짜 백엔드: http://localhost:{A.port}  (받는 곳 POST /internal/meetings/<id>/transcripts, Ctrl+C로 종료)', flush=True)
     try: srv.serve_forever()
     except KeyboardInterrupt: pass
