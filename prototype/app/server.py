@@ -23,6 +23,11 @@ http://localhost:8765 에서 열림. 외부로 보내지 않음. 녹음은 저�
 요약 쪽 전송 (summary_sender.py, 2026-10-14 회의에서 정한 형식)
   세션 = 회의. 세션마다 meeting_id를 붙이고, 확정 줄을 --send-period초(기본 10)마다 묶어 보냄. 시작·멈춤·재개·끝 알림은 바로 보냄
   --summary-url이 없으면 세션 파일 옆 <이름>.outbox.jsonl 에만 기록
+
+백엔드 전송 (backend_sender.py, CN팀 2장 2.2 + AI팀 추가 필드, 2026-10-15 확정)
+  말하는 중·확정·보완 줄을 --backend-period초(기본 0.5)마다 바뀐 것만 POST {--backend-url}/internal/meetings/{meeting_id}/transcripts
+  화면에서 고치거나 지운 것은 보내지 않음 (정식 서비스에서는 백엔드가 처리). 발화자 구분은 하지 않아 화자 번호는 보내지 않음
+  --backend-url이 없으면 세션 파일 옆 <이름>.backend.jsonl 에만 기록
 """
 import argparse, datetime, json, os, queue, shutil, signal, subprocess, sys, threading, time, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +36,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from engine import Engine, SR, DEFAULT_MODELS, line_kind  # noqa: E402
 from summary_sender import Sender  # noqa: E402
+from backend_sender import BackendSender  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 p = argparse.ArgumentParser()
@@ -56,6 +62,8 @@ p.add_argument('--max-len', type=float, default=10.0, help='한 줄 최대 길�
 p.add_argument('--overlap', type=float, default=1.0, help='최대 길이로 끊을 때 직전 소리를 새 줄에 다시 넣는 길이(초). 걸친 단어를 살리는 대신 앞뒤 줄에 겹칠 수 있음. 0이면 끔')
 p.add_argument('--summary-url', default='', help='요약 쪽 받는 주소 (예: http://localhost:8000/stt). 없으면 outbox 파일에만 기록')
 p.add_argument('--send-period', type=float, default=10.0, help='요약 쪽 전송 주기(초)')
+p.add_argument('--backend-url', default='', help='백엔드 주소 (예: http://meeting-service:8080). 없으면 backend.jsonl 파일에만 기록')
+p.add_argument('--backend-period', type=float, default=0.5, help='백엔드 전송 주기(초). 그사이 바뀐 줄만 보냄')
 p.add_argument('--meeting-id', default='', help='첫 회의의 meeting_id (앱이 줄 값. 없으면 자동)')
 A = p.parse_args()
 
@@ -93,6 +101,7 @@ ENGINE = None       # 화면에서 화자 합치기·참석자 수를 바꿀 때
 manual_seq = 0      # 직접 추가한 줄 번호
 SENDER = Sender(A.summary_url, A.send_period, now=lambda: ENGINE.fed if ENGINE else 0.0,
                 log=lambda m: print(m, file=sys.stderr, flush=True), on_update=lambda ev: publish(ev))
+BACKEND = BackendSender(A.backend_url, A.backend_period, log=lambda m: print(m, file=sys.stderr, flush=True))
 
 
 clear_at = -1.0     # 마지막으로 지운 오디오 시각. 이보다 앞에서 시작한 보완 줄은 나중에 도착해도 버림
@@ -106,7 +115,7 @@ def publish(ev):
         if (ev['type'] in ('partial', 'final') and ev['id'] <= clear_id) or (ev['type'] == 'recovered' and ev['start'] < clear_at):
             return   # 지우기 전 줄 (말하던 중이던 줄, 판단 대기 중이던 보완)
         if ev['type'] == 'partial':
-            partial = ev
+            partial = ev; BACKEND.partial(ev)
         elif ev['type'] in ('send', 'send_pending'):   # 요약 전송 상태창. 보낸 줄·수정에 묶음 번호를 붙여 둠 (새로 접속한 화면용)
             m = ev.get('entry', {}).get('msg', {})
             for x in m.get('lines', []):
@@ -153,6 +162,7 @@ def publish(ev):
             lines[ev['id']] = ev
             if partial and partial['id'] == ev['id']: partial = None
             if ev['type'] in ('final', 'recovered', 'manual'): SENDER.line(ev)
+            if ev['type'] in ('final', 'recovered'): BACKEND.line(ev)   # 직접 추가한 줄은 백엔드에서 생기므로 보내지 않음
         for q in clients: q.put(ev)
         if ev['type'] not in ('partial', 'status'): save_session()
 
@@ -171,6 +181,7 @@ def new_session(t0, path=None):
     SESS = {'file': base, 'wav_path': None, 'wav': None, 'wav_t0': None, 't0': round(t0, 2), 'meeting_id': mid,
             'started': datetime.datetime.now().isoformat(timespec='seconds'), 'complete': False}
     SENDER.start(mid, t0, os.path.splitext(base)[0] + '.outbox.jsonl')
+    BACKEND.start(mid, t0, os.path.splitext(base)[0] + '.backend.jsonl')
     status['session'] = os.path.basename(base); status['rec'] = False; status['rec_sec'] = 0.0
 
 
@@ -218,12 +229,12 @@ def control(eng, act):
         SESS['wav'] = w; SESS['wav_t0'] = round(eng.fed - len(pre) / SR, 2); status['rec'] = True; status['rec_sec'] = 0.0
         rec_write(pre)
     elif act == 'pause' and st == 'run':
-        flush(); status['state'] = 'pause'; SENDER.event('pause')
+        flush(); status['state'] = 'pause'; SENDER.event('pause'); BACKEND.flush()
     elif act == 'resume' and st == 'pause':
         status['state'] = 'run'; SENDER.event('resume')
     elif act == 'complete' and st in ('run', 'pause'):
         if st == 'run': flush()
-        rec_close(); status['state'] = 'idle'; status['rec'] = False; SENDER.event('end')
+        rec_close(); status['state'] = 'idle'; status['rec'] = False; SENDER.event('end'); BACKEND.flush()
         with lock: SESS['complete'] = True; save_session()
     else:
         return
@@ -497,6 +508,7 @@ def main():
         with lock:
             rec_close()
             if SESS and not SESS['complete']: SENDER.event('end')   # 완료를 누르지 않고 끈 경우
+            BACKEND.flush()
             if SESS:
                 save_session(); print(f'전사문 저장: {SESS["file"]}' + (f'  녹음: {SESS["wav_path"]}' if SESS['wav_path'] else ''))
         srv.server_close()
