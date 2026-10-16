@@ -42,7 +42,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from envfile import load_env  # noqa: E402
 ENV_LOADED = load_env()   # engine의 모델 폴더 기본값(NINEOUTING_STT_MODELS)도 .env를 따르도록 engine보다 먼저
-from engine import Engine, SR, DEFAULT_MODELS, line_kind  # noqa: E402
+from engine import Engine, SR, DEFAULT_MODELS, DEFAULTS, line_kind  # noqa: E402
 from summary_sender import Sender  # noqa: E402
 from backend_sender import BackendSender  # noqa: E402
 
@@ -60,19 +60,19 @@ p.add_argument('--diag', action='store_true', help='30초마다 입력 상태(�
                '없어도 마이크 소리가 빠지면(최근 30초 1%% 이상, 입력 넘침) 경고 한 줄은 나옴')
 p.add_argument('--wav', default=''); p.add_argument('--port', type=int, default=os.environ.get('STT_PORT', 8765), help='화면 포트 (.env STT_PORT)')
 p.add_argument('--models', default=DEFAULT_MODELS, help='모델 폴더 (기본: prototype/models, .env NINEOUTING_STT_MODELS). 받기: python tools/download_models.py')
-p.add_argument('--chunk', default='64', choices=['16', '64'])
-p.add_argument('--hotwords', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hotwords.txt'),
+p.add_argument('--chunk', default=DEFAULTS['chunk'], choices=['16', '64'])
+p.add_argument('--hotwords', default=DEFAULTS['hotwords'],
                help="핫워드(회의 용어) 파일. 기본 app/hotwords.txt 31개. 끄려면 --hotwords ''")
-p.add_argument('--hotwords-score', type=float, default=1.0)
-p.add_argument('--blank-penalty', type=float, default=0.5, help='글자 안 냄(blank)에 주는 벌점. 빠지는 말이 줄고 틀린·낀 글자가 조금 늚. 0이면 끔 (1.0부터 삽입 급증)')
+p.add_argument('--hotwords-score', type=float, default=DEFAULTS['hotwords_score'])
+p.add_argument('--blank-penalty', type=float, default=DEFAULTS['blank_penalty'], help='글자 안 냄(blank)에 주는 벌점. 빠지는 말이 줄고 틀린·낀 글자가 조금 늚. 0이면 끔 (1.0부터 삽입 급증)')
 p.add_argument('--no-recover', action='store_true'); p.add_argument('--out', default='', help='첫 세션 전사 파일 경로 (기본: 자동 이름)')
 p.add_argument('--save-dir', default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'transcripts'),
                help='세션 전사·녹음 파일 폴더 (기본: prototype/transcripts, 깃 제외)')
 p.add_argument('--no-diar', action='store_true', help='화자 번호 표시 끄기')
 p.add_argument('--no-alt', action='store_true', help='다른 인식 결과 끄기 (메모리 약 300MB 절약, 추정)')
 p.add_argument('--max-speakers', type=int, default=0, help='참석자 수 (0이면 자동). 화면에서도 바꿀 수 있음')
-p.add_argument('--max-len', type=float, default=10.0, help='한 줄 최대 길이(초). 쉼 없이 길게 말하면 이 길이에서 끊음 (이전 20)')
-p.add_argument('--overlap', type=float, default=1.0, help='최대 길이로 끊을 때 직전 소리를 새 줄에 다시 넣는 길이(초). 걸친 단어를 살리는 대신 앞뒤 줄에 겹칠 수 있음. 0이면 끔')
+p.add_argument('--max-len', type=float, default=DEFAULTS['max_len'], help='한 줄 최대 길이(초). 쉼 없이 길게 말하면 이 길이에서 끊음 (이전 20)')
+p.add_argument('--overlap', type=float, default=DEFAULTS['overlap'], help='최대 길이로 끊을 때 직전 소리를 새 줄에 다시 넣는 길이(초). 걸친 단어를 살리는 대신 앞뒤 줄에 겹칠 수 있음. 0이면 끔')
 p.add_argument('--summary-url', default='', help='요약 쪽 받는 주소 (예: http://localhost:8000/stt). 없으면 outbox 파일에만 기록')
 p.add_argument('--send-period', type=float, default=10.0, help='요약 쪽 전송 주기(초)')
 p.add_argument('--backend-url', default=os.environ.get('BACKEND_URL', ''),
