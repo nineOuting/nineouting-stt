@@ -23,6 +23,16 @@ http://localhost:8765 에서 열림. 외부로 보내지 않음. 녹음은 저�
 요약 쪽 전송 (summary_sender.py, 2026-10-14 회의에서 정한 형식)
   세션 = 회의. 세션마다 meeting_id를 붙이고, 확정 줄을 --send-period초(기본 10)마다 묶어 보냄. 시작·멈춤·재개·끝 알림은 바로 보냄
   --summary-url이 없으면 세션 파일 옆 <이름>.outbox.jsonl 에만 기록
+
+브라우저 입력 (--input ws, CN팀 2장 2.1 검토 확정)
+  회의록 작성자 브라우저가 16kHz 모노 16비트 PCM 100ms 조각과 start·pause·resume·end(JSON)를 WebSocket으로 보냄 (규약은 ws_handler 위 설명)
+  서버를 켜면 대기하다가 start를 받으면 그 meetingId로 세션을 엶. 시험용 보내는 화면: http://localhost:8765/sender
+  실행: .venv/bin/python app/server.py --input ws --backend-url http://127.0.0.1:8767
+
+백엔드 전송 (backend_sender.py, CN팀 2장 2.2 + AI팀 추가 필드, 2026-10-15 확정)
+  말하는 중·확정·보완 줄을 --backend-period초(기본 0.5)마다 바뀐 것만 POST {--backend-url}/internal/meetings/{meeting_id}/transcripts
+  화면에서 고치거나 지운 것은 보내지 않음 (정식 서비스에서는 백엔드가 처리). 발화자 구분은 하지 않아 화자 번호는 보내지 않음
+  --backend-url이 없으면 세션 파일 옆 <이름>.backend.jsonl 에만 기록
 """
 import argparse, datetime, json, os, queue, shutil, signal, subprocess, sys, threading, time, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,10 +41,14 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from engine import Engine, SR, DEFAULT_MODELS, line_kind  # noqa: E402
 from summary_sender import Sender  # noqa: E402
+from backend_sender import BackendSender  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 p = argparse.ArgumentParser()
-p.add_argument('--input', default='sd', choices=['sd', 'ffmpeg'], help='마이크 입력 방식 (sd=sounddevice/CoreAudio, ffmpeg=avfoundation)')
+p.add_argument('--input', default='sd', choices=['sd', 'ffmpeg', 'ws'],
+               help='입력 방식 (sd=sounddevice 마이크, ffmpeg=avfoundation 마이크, ws=브라우저가 WebSocket으로 보내는 소리)')
+p.add_argument('--ws-host', default='127.0.0.1', help='--input ws: WebSocket 받는 주소')
+p.add_argument('--ws-port', type=int, default=8770, help='--input ws: WebSocket 포트. 시험용 보내는 화면은 http://localhost:<--port>/sender')
 p.add_argument('--device', default='', help='마이크 장치 번호 (--list-devices). 없으면 sd는 시스템 기본 입력, ffmpeg는 0')
 p.add_argument('--list-devices', action='store_true')
 p.add_argument('--diag', action='store_true', help='30초마다 입력 상태(실제 시간 대비 받은 소리, 읽기 대기, 처리 시간)를 터미널에 출력. '
@@ -56,6 +70,8 @@ p.add_argument('--max-len', type=float, default=10.0, help='한 줄 최대 길�
 p.add_argument('--overlap', type=float, default=1.0, help='최대 길이로 끊을 때 직전 소리를 새 줄에 다시 넣는 길이(초). 걸친 단어를 살리는 대신 앞뒤 줄에 겹칠 수 있음. 0이면 끔')
 p.add_argument('--summary-url', default='', help='요약 쪽 받는 주소 (예: http://localhost:8000/stt). 없으면 outbox 파일에만 기록')
 p.add_argument('--send-period', type=float, default=10.0, help='요약 쪽 전송 주기(초)')
+p.add_argument('--backend-url', default='', help='백엔드 주소 (예: http://meeting-service:8080). 없으면 backend.jsonl 파일에만 기록')
+p.add_argument('--backend-period', type=float, default=0.5, help='백엔드 전송 주기(초). 그사이 바뀐 줄만 보냄')
 p.add_argument('--meeting-id', default='', help='첫 회의의 meeting_id (앱이 줄 값. 없으면 자동)')
 A = p.parse_args()
 
@@ -87,12 +103,13 @@ lock = threading.RLock()   # 요약 전송 알림이 publish 안에서 다시 pu
 lines = {}          # id → 확정·보완 줄 (새로 접속한 화면에 보냄)
 partial = None      # 지금 말하는 중인 줄
 clients = []        # 화면별 큐
-status = {'source': A.wav or f'마이크 {A.device or "기본"} ({A.input})', 'audio_sec': 0.0, 'running': True, 'max_speakers': A.max_speakers,
+status = {'source': A.wav or (f'WebSocket ws://{A.ws_host}:{A.ws_port}' if A.input == 'ws' else f'마이크 {A.device or "기본"} ({A.input})'), 'audio_sec': 0.0, 'running': True, 'max_speakers': A.max_speakers,
           'state': 'run', 'rec': False, 'rec_sec': 0.0, 'session': ''}   # state: run(전사 중) / pause(일시정지) / idle(완료 후 대기)
 ENGINE = None       # 화면에서 화자 합치기·참석자 수를 바꿀 때 씀
 manual_seq = 0      # 직접 추가한 줄 번호
 SENDER = Sender(A.summary_url, A.send_period, now=lambda: ENGINE.fed if ENGINE else 0.0,
                 log=lambda m: print(m, file=sys.stderr, flush=True), on_update=lambda ev: publish(ev))
+BACKEND = BackendSender(A.backend_url, A.backend_period, log=lambda m: print(m, file=sys.stderr, flush=True))
 
 
 clear_at = -1.0     # 마지막으로 지운 오디오 시각. 이보다 앞에서 시작한 보완 줄은 나중에 도착해도 버림
@@ -107,6 +124,7 @@ def publish(ev):
             return   # 지우기 전 줄 (말하던 중이던 줄, 판단 대기 중이던 보완)
         if ev['type'] == 'partial':
             partial = ev
+            if not CATCHUP[0]: BACKEND.partial(ev)   # 몰아 보내는 동안은 확정 줄만 보냄
         elif ev['type'] in ('send', 'send_pending'):   # 요약 전송 상태창. 보낸 줄·수정에 묶음 번호를 붙여 둠 (새로 접속한 화면용)
             m = ev.get('entry', {}).get('msg', {})
             for x in m.get('lines', []):
@@ -153,6 +171,7 @@ def publish(ev):
             lines[ev['id']] = ev
             if partial and partial['id'] == ev['id']: partial = None
             if ev['type'] in ('final', 'recovered', 'manual'): SENDER.line(ev)
+            if ev['type'] in ('final', 'recovered'): BACKEND.line(ev)   # 직접 추가한 줄은 백엔드에서 생기므로 보내지 않음
         for q in clients: q.put(ev)
         if ev['type'] not in ('partial', 'status'): save_session()
 
@@ -162,15 +181,16 @@ SESS = None        # 지금 세션: file, wav_path, wav(쓰는 중인 wave 객�
 CTRL = queue.Queue()   # 화면의 녹음·일시정지·완료 요청. 소리 입력 스레드가 소리 조각 사이에 처리함
 
 
-def new_session(t0, path=None):
+def new_session(t0, path=None, mid=None):
     global SESS
     os.makedirs(A.save_dir, exist_ok=True)
     base = path or os.path.join(A.save_dir, datetime.datetime.now().strftime('%Y%m%d_%H%M%S') + '.jsonl')
     os.makedirs(os.path.dirname(os.path.abspath(base)), exist_ok=True)
-    mid = (A.meeting_id if A.meeting_id and SESS is None else '') or 'm_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    mid = mid or (A.meeting_id if A.meeting_id and SESS is None else '') or 'm_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     SESS = {'file': base, 'wav_path': None, 'wav': None, 'wav_t0': None, 't0': round(t0, 2), 'meeting_id': mid,
             'started': datetime.datetime.now().isoformat(timespec='seconds'), 'complete': False}
     SENDER.start(mid, t0, os.path.splitext(base)[0] + '.outbox.jsonl')
+    BACKEND.start(mid, t0, os.path.splitext(base)[0] + '.backend.jsonl')
     status['session'] = os.path.basename(base); status['rec'] = False; status['rec_sec'] = 0.0
 
 
@@ -178,6 +198,7 @@ def save_session():
     """지금 세션의 줄을 파일에 통째로 다시 씀 (lock 안에서 호출). 첫 줄은 _meta"""
     if not SESS: return
     meta = {k: SESS[k] for k in ('meeting_id', 'started', 't0', 'wav_t0', 'complete')}
+    if SESS.get('gaps'): meta['gaps'] = SESS['gaps']   # --input ws: 멈춤 때 넣은 무음 [엔진 시각, 길이]. 회의 시각 = start - t0 - (그 앞 gaps 합)
     meta.update(source=status['source'], wav=SESS['wav_path'] and os.path.basename(SESS['wav_path']),
                 note='start·end는 서버 시작 뒤 엔진에 넣은 소리 기준 초. wav 안의 시각 = start - wav_t0')
     tmp = SESS['file'] + '.tmp'
@@ -207,6 +228,15 @@ def control(eng, act):
         z = np.zeros(1600, np.float32)
         for _ in range(25): eng.feed(z); rec_write(z)
         status['audio_sec'] = round(eng.fed, 1)
+    if isinstance(act, tuple) and act[0] == 'start':   # --input ws: 브라우저가 회의 시작을 알림 (meetingId, 회의 시작 기준 음성 초)
+        _, mid, off = act
+        if st in ('run', 'pause'): control(eng, 'complete')   # 다른 회의가 열려 있으면 닫음
+        with lock: new_session(eng.fed - off, mid=mid)          # 줄 시각 = 회의 시작 기준 음성 시간이 되도록 기준점을 맞춤
+        publish({'type': 'clear', 'session_switch': True})
+        status['state'] = 'run'
+        with lock: save_session()
+        publish({'type': 'status', **{k: status[k] for k in ('state', 'rec', 'rec_sec', 'session', 'audio_sec')}})
+        return
     if act == 'record' and st == 'idle':      # 새 세션: 화면을 비우고 새 파일로
         with lock: new_session(eng.fed)   # 먼저 새 세션으로 바꿔야 아래 clear가 닫은 세션 파일을 비우지 않음
         publish({'type': 'clear', 'session_switch': True})
@@ -218,17 +248,95 @@ def control(eng, act):
         SESS['wav'] = w; SESS['wav_t0'] = round(eng.fed - len(pre) / SR, 2); status['rec'] = True; status['rec_sec'] = 0.0
         rec_write(pre)
     elif act == 'pause' and st == 'run':
-        flush(); status['state'] = 'pause'; SENDER.event('pause')
+        at = eng.fed; flush()
+        if A.input == 'ws' and not A.wav:   # 브라우저가 세는 회의 시간에는 이 무음이 없음 → 전송 시각에서 뺌
+            for s in (SENDER, BACKEND): s.gap(at, eng.fed - at)
+            SESS.setdefault('gaps', []).append([round(at, 2), round(eng.fed - at, 2)])
+        status['state'] = 'pause'; SENDER.event('pause'); BACKEND.flush()
     elif act == 'resume' and st == 'pause':
         status['state'] = 'run'; SENDER.event('resume')
     elif act == 'complete' and st in ('run', 'pause'):
         if st == 'run': flush()
-        rec_close(); status['state'] = 'idle'; status['rec'] = False; SENDER.event('end')
+        rec_close(); status['state'] = 'idle'; status['rec'] = False; SENDER.event('end'); BACKEND.flush()
         with lock: SESS['complete'] = True; save_session()
     else:
         return
     with lock: save_session()
     publish({'type': 'status', **{k: status[k] for k in ('state', 'rec', 'rec_sec', 'session', 'audio_sec')}})
+
+
+# ---- WebSocket 입력 (--input ws) ----
+# 브라우저(회의록 작성자)가 보내는 소리를 받음. 규약은 CN팀 2장 2.1 검토 (2026-10-15 확정, 메시지 이름은 AI팀이 정함)
+#   바이너리: 16kHz 모노 16비트 PCM(little-endian), 100ms = 3,200바이트
+#   텍스트(JSON): {"type":"start","meetingId":"…","offsetMs":0} / {"type":"pause"} / {"type":"resume"} / {"type":"end"}
+#     start의 offsetMs = 이어서 보낼 소리가 회의 시작 기준 몇 ms부터인지. 같은 회의로 다시 연결하면 겹친 만큼 버리고 빈 만큼 무음으로 채움
+#   서버 → 브라우저: {"type":"ready","meetingId","meetingMs"} (meetingMs = 서버가 받은 그 회의 소리 길이), {"type":"ended"}, {"type":"error","message"}
+# 회의(연결)는 한 번에 하나. 두 번째 연결은 거절함. 작성자 확인은 백엔드 몫이라 하지 않음
+# 소리와 제어 메시지를 한 대기열에 순서대로 넣어, 소리 처리 루프가 받은 순서대로 처리함
+WSQ = queue.Queue()
+WS = {'conn': None, 'meeting': None, 'ms': 0.0, 'skip': 0}   # 지금 연결, 회의, 그 회의에서 받은 소리(ms), 겹쳐서 버릴 바이트
+CATCHUP = [False]   # 밀린 소리가 1초 넘게 쌓임 (다시 연결 뒤 몰아 보내는 중) → 말하는 중 줄은 백엔드로 보내지 않음
+MS = SR * 2 // 1000   # 1ms = 32바이트
+
+
+def ws_handler(conn):
+    from websockets.exceptions import ConnectionClosed
+    say = lambda **m: conn.send(json.dumps(m, ensure_ascii=False))
+    with lock:
+        if WS['conn'] is not None:
+            conn.close(1008, 'another connection is active'); return
+        WS['conn'] = conn
+    print(f'WebSocket 연결: {conn.remote_address}', file=sys.stderr, flush=True)
+    try:
+        for msg in conn:
+            if isinstance(msg, bytes):
+                if WS['meeting'] is None: continue          # start 전 소리는 버림
+                if WS['skip']:                               # 다시 연결 뒤 이미 받은 부분
+                    k = min(WS['skip'], len(msg)); msg = msg[k:]; WS['skip'] -= k
+                if len(msg) % 2: msg = msg[:-1]
+                if msg: WSQ.put(msg); WS['ms'] += len(msg) / MS
+                continue
+            try: m = json.loads(msg)
+            except ValueError:
+                say(type='error', message='JSON이 아님'); continue
+            t = m.get('type')
+            if t == 'start':
+                mid = str(m.get('meetingId') or '').strip(); off = float(m.get('offsetMs') or 0)
+                if not mid:
+                    say(type='error', message='meetingId 없음'); continue
+                if mid == WS['meeting']:                     # 같은 회의로 다시 연결
+                    gap = off - WS['ms']
+                    if gap > 0:                              # 빈 시간은 무음으로 채워 시각을 맞춤
+                        if gap > 10000: print(f'다시 연결: {gap / 1000:.1f}초가 비어 무음으로 채움', file=sys.stderr, flush=True)
+                        z = bytes(int(gap) * MS)
+                        for i in range(0, len(z), 3200): WSQ.put(z[i:i + 3200])
+                        WS['ms'] += int(gap)
+                    elif gap < 0: WS['skip'] = int(-gap) * MS
+                else:
+                    WS.update(meeting=mid, ms=off, skip=0)
+                    WSQ.put(('start', mid, off / 1000))
+                say(type='ready', meetingId=mid, meetingMs=round(WS['ms']))
+            elif t in ('pause', 'resume'):
+                WSQ.put(t)
+            elif t == 'end':
+                WSQ.put('complete'); WS['meeting'] = None; say(type='ended')
+            else:
+                say(type='error', message=f'모르는 type: {t}')
+    except ConnectionClosed:
+        pass
+    finally:
+        with lock: WS['conn'] = None
+        print('WebSocket 연결 끊김' + (f' (회의 {WS["meeting"]}는 열린 채 다시 연결을 기다림)' if WS['meeting'] else ''), file=sys.stderr, flush=True)
+
+
+def ws_read():
+    """소리면 bytes, 제어 메시지면 제어 대기열로 넘기고 None, 0.1초 동안 없으면 None"""
+    try: item = WSQ.get(timeout=0.1)
+    except queue.Empty: return None
+    if not isinstance(item, bytes):
+        CTRL.put(item); return None
+    CATCHUP[0] = WSQ.qsize() > 10
+    return item
 
 
 # ---- 소리 입력 스레드 ----
@@ -288,10 +396,17 @@ def _audio_loop():
                  chunk=A.chunk, hotwords=A.hotwords, hotwords_score=A.hotwords_score, recover=not A.no_recover,
                  spk_model=f'{A.models}/speaker/nemo_en_titanet_small.onnx', diar=not A.no_diar, alt=not A.no_alt,
                  max_len=A.max_len, overlap=A.overlap, blank_penalty=A.blank_penalty)
-    stream = None; sdq = None; flags = {}
+    stream = None; sdq = None; flags = {}; wss = None
     if A.wav:
         w = wave.open(A.wav); assert w.getframerate() == SR and w.getnchannels() == 1 and w.getsampwidth() == 2
         read = lambda: w.readframes(1600)
+    elif A.input == 'ws':
+        from websockets.sync.server import serve
+        wss = serve(ws_handler, A.ws_host, A.ws_port, max_size=2 ** 20)   # ping은 websockets 기본값(20초)으로 보냄
+        threading.Thread(target=wss.serve_forever, daemon=True).start()
+        status['source'] = f'WebSocket ws://{A.ws_host}:{A.ws_port}'
+        print(f'WebSocket 입력 대기: ws://{A.ws_host}:{A.ws_port}  시험용 보내는 화면: http://localhost:{A.port}/sender', file=sys.stderr, flush=True)
+        read = ws_read
     elif A.input == 'sd':
         # CoreAudio가 자기 스레드에서 0.1초 조각을 대기열에 넣음 → 처리가 잠깐 늦어도 입력이 버려지지 않음
         import sounddevice as sd
@@ -317,12 +432,16 @@ def _audio_loop():
         threading.Thread(target=lambda: ffmpeg_err.extend(l.decode(errors='replace').rstrip() for l in proc.stderr),
                          daemon=True).start()
         read = lambda: proc.stdout.read(3200)
-    D = Diag(sdq, flags, verbose=A.diag) if (A.diag or not A.wav) else None   # 마이크 입력은 항상 지켜봄 (문제 있을 때만 경고)
+    # 마이크 입력은 항상 지켜봄 (문제 있을 때만 경고). WebSocket 입력은 브라우저가 멈추거나 끊긴 동안도 시간이 흘러 빠짐으로 잘못 세므로 --diag일 때만
+    D = Diag(sdq, flags, verbose=A.diag) if (A.diag or (not A.wav and A.input != 'ws')) else None
     if D:   # 엔진이 부르는 화면 알림·파일 저장 시간을 따로 셈 (다른 결과 스레드의 알림은 세지 않음)
         def timed(ev, _p=publish):
             t = time.perf_counter(); _p(ev); D.pub += time.perf_counter() - t
         eng.on_event = timed
-    with lock: new_session(0.0, A.out or None); save_session()
+    if A.input == 'ws' and not A.wav:   # 브라우저가 start를 보낼 때 세션을 엶
+        status['state'] = 'idle'
+    else:
+        with lock: new_session(0.0, A.out or None); save_session()
     t0 = time.perf_counter(); fed = 0.0
     try:
         while not stop.is_set():
@@ -333,6 +452,7 @@ def _audio_loop():
             if A.wav and status['state'] != 'run':   # 파일 입력은 멈춘 동안 읽지 않음 (위치 유지)
                 time.sleep(0.1); continue
             tr = time.perf_counter(); b = read()
+            if b is None: continue   # WebSocket: 소리가 아직 없거나 제어 메시지를 넘김
             if not b:
                 if proc and not stop.is_set():  # 서버가 끄지 않았는데 ffmpeg가 멈춤 → 원인 메시지를 보여줌
                     time.sleep(0.2)
@@ -354,6 +474,7 @@ def _audio_loop():
             fed += len(c) / SR; status['audio_sec'] = round(eng.fed, 1)
     finally:
         if stream: stream.stop(); stream.close()
+        if wss: wss.shutdown()
     eng.finish(); status['running'] = False
     publish({'type': 'status', 'running': False})
 
@@ -363,7 +484,11 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
     def do_GET(self):
-        if self.path in ('/', '/index.html'):
+        if self.path == '/sender':   # 시험용 보내는 화면 (마이크 → WebSocket, --input ws와 함께 씀)
+            body = open(os.path.join(os.path.dirname(STATIC), '..', 'tools', 'mic_sender.html'), 'rb').read()
+            self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+        elif self.path in ('/', '/index.html'):
             body = open(os.path.join(STATIC, 'index.html'), 'rb').read()
             self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
@@ -497,6 +622,7 @@ def main():
         with lock:
             rec_close()
             if SESS and not SESS['complete']: SENDER.event('end')   # 완료를 누르지 않고 끈 경우
+            BACKEND.flush()
             if SESS:
                 save_session(); print(f'전사문 저장: {SESS["file"]}' + (f'  녹음: {SESS["wav_path"]}' if SESS['wav_path'] else ''))
         srv.server_close()

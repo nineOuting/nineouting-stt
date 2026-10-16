@@ -51,15 +51,22 @@ class Sender:
         self.on_update({'type': 'send_pending', 'snap': self.snapshot()})
 
     def _ms(self, t):
-        return max(0, int(round((t - self.meeting['t0']) * 1000)))
+        """엔진 시각(초) → 회의 시작 기준 밀리초. 멈춤 처리로 넣은 무음 구간(gap)은 회의 시간에서 뺌"""
+        cut = sum(min(dur, max(0.0, t - at)) for at, dur in self.meeting.get('gaps', []))
+        return max(0, int(round((t - self.meeting['t0'] - cut) * 1000)))
 
     def start(self, meeting_id, t0, outbox):
         """새 회의. 이전 회의에서 못 보낸 것은 먼저 보냄"""
         self.flush()
         with self.lock:
-            self.meeting = {'id': meeting_id, 't0': t0, 'outbox': outbox, 'seq': 0}
+            self.meeting = {'id': meeting_id, 't0': t0, 'outbox': outbox, 'seq': 0, 'gaps': []}
             self.lines, self.edits = [], {}
         self.event('start')
+
+    def gap(self, at, dur):
+        """엔진 시각 at부터 dur초는 회의 시간이 아님 (브라우저 입력에서 멈출 때 줄 마무리용으로 넣은 무음)"""
+        with self.lock:
+            if self.meeting: self.meeting['gaps'].append((at, dur))
 
     def event(self, name):
         if name in ('pause', 'end'): self.flush()   # 멈추거나 끝낼 때는 남은 줄을 먼저 보냄
