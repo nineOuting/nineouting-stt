@@ -607,7 +607,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # 정리(마이크 끄기·저장)는 최대 약 10초. 그 사이 Ctrl+C를 또 누르면 저장이 끊기므로 무시함 (강제 종료는 Ctrl+\)
+        # 정리(마이크 끄기·저장)는 최대 약 10초. 그 사이 Ctrl+C를 또 누르면 저장이 끊기므로 무시함 (강제 종료는 맥 Ctrl+\, 윈도우는 터미널 창 닫기)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         print('\n끄는 중… 녹음·전사 파일을 저장하고 있으니 잠시 기다려 주세요 (최대 약 10초)', flush=True)
         stop.set()

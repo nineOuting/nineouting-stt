@@ -1,0 +1,2 @@
+# 핫워드 파일은 sherpa-onnx가 직접 읽음: 윈도우에서도 줄 끝을 LF로 받아 단어 끝에 \r이 붙지 않게
+*.txt text eol=lf

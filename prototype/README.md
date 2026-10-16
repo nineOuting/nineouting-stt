@@ -24,6 +24,8 @@ py -m venv .venv
 .venv\Scripts\pip install --only-binary=:all: -r requirements.txt
 ```
 
+`py`가 없다고 나오면 `python -m venv .venv` (Microsoft Store에서 설치한 파이썬).
+
 맥
 
 ```bash
@@ -76,6 +78,17 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 `.env`에서 값만 고치고 서버를 다시 켬 (`BACKEND_URL`을 넣으면 `--backend-url` 없이 실행 가능). 항목 설명은 `.env.example` 안에 있음.
 같은 값을 명령 옵션으로 주면 옵션이 우선함. `.env`는 깃에 올라가지 않음.
 
+### 잘 안 될 때
+
+| 증상 | 해결 |
+|---|---|
+| 설치에서 `No matching distribution` | 파이썬이 3.11 이하. 3.12 이상으로 `.venv`를 다시 만듦 |
+| 모델 받기에서 `CERTIFICATE_VERIFY_FAILED` (맥) | python.org 파이썬이면 `/Applications/Python 3.x/Install Certificates.command`를 한 번 실행 |
+| 서버 시작에서 `WinError 10013` 또는 `Address already in use` | 그 포트를 다른 프로그램이 쓰거나 윈도우가 예약함. `.env`에서 `STT_PORT`·`WS_PORT`·`MOCK_PORT`를 바꿈 |
+| 모델 파일이 있는데 열지 못함 (윈도우) | 경로에 한글이 있으면 생길 수 있음 (미확인). `.env`의 `NINEOUTING_STT_MODELS`를 `C:\nineouting\models` 같은 영문 경로로 두고 모델을 다시 받음 |
+| 마이크 장치를 열지 못함 | `--list-devices`로 목록을 보고 `--device 번호`로 다른 장치를 고름 |
+| 끄는 중에 멈춘 것 같음 | 저장에 최대 약 10초 걸림. 그래도 안 꺼지면 맥은 Ctrl+\, 윈도우는 터미널 창 닫기 |
+
 ## 확인용 화면
 
 모두 시험용이고 실제 FE·백엔드가 아님.
@@ -111,6 +124,7 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
   - 소리: 바이너리로 16kHz 모노 16비트 PCM(little-endian), 100ms(3,200바이트)씩
   - 제어(JSON): `{"type":"start","meetingId":"…","offsetMs":0}`, `{"type":"pause"}`, `{"type":"resume"}`, `{"type":"end"}`
   - 응답(JSON): `ready`(서버가 받은 그 회의 소리 길이 `meetingMs`), `ended`, `error`
+  - 시각은 모두 회의 시작 기준 음성 밀리초. 실제 시각(벽시계)은 브라우저가 보내지 않음 (백엔드가 기록)
   - 끊겼다 다시 붙을 때는 `start`의 `offsetMs`에 이어 보낼 위치를 넣음. 겹친 부분은 버리고 빈 시간은 무음으로 채움
   - 연결은 한 번에 하나 (두 번째 연결은 코드 1008로 거절)
 - 파일: 세션마다 `transcripts/날짜_시각.jsonl`(전사), `.backend.jsonl`(백엔드로 보낸 것), 녹음 버튼을 누르면 `.wav`. 깃에 올라가지 않음
@@ -128,7 +142,7 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 
 ## 알려진 제한
 
-- 윈도우에서는 아직 처음부터 따라 해 보지 않음
+- 윈도우에서는 아직 처음부터 따라 해 보지 않음 (패키지의 윈도우용 설치 파일이 있는 것만 확인)
 - 아주 짧은 대답이나 말이 겹치는 부분은 빠지거나 틀리기 쉬움 (보완 줄로 일부만 되살림)
 - 보완 줄과 이웃 줄의 경계에서 한 단어가 겹칠 수 있음
 - 화면에서 고친 내용은 백엔드로 보내지 않음 (정식 서비스에서는 백엔드가 처리)
