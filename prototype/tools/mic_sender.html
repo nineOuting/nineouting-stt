@@ -7,7 +7,7 @@
 - "끊고 다시 붙기": 연결을 끊은 동안 소리를 모아 두었다가, 다시 연결해 start(offsetMs)로 이어서 몰아 보냄 (장애 뒤 몰아 보내기 시험)
 - 아래 자막: 가짜 백엔드(tools/mock_backend.py)가 2.2 규칙으로 합친 자막을 구독해 보여줌. 실서비스의 작성자 화면처럼
   "보내기 → STT → 백엔드 → 자막"을 한 화면에서 봄. 가짜 백엔드는 SSE로 내려주지만 실제 백엔드는 WebSocket 예정 (합치는 규칙은 같음)
-열기: STT 서버를 --input ws로 켜고 http://localhost:8765/sender
+열기: STT 서버를 --input ws로 켜고 http://localhost:8765/sender (WebSocket 포트·자막 주소는 서버 설정을 따라 자동으로 채워짐)
 -->
 <html lang="ko"><head><meta charset="utf-8"><title>시험용 보내는 화면</title>
 <style>
@@ -41,7 +41,9 @@ fieldset{border:1px solid #ddd;margin:10px 0}
 <h3>기록</h3><div id="log"></div>
 <script>
 const $ = id => document.getElementById(id);
-$('url').value = `ws://${location.hostname || 'localhost'}:8770`;
+// 서버가 /sender로 내보낼 때 /*CFG*/ 사이를 실제 값(WS_PORT, BACKEND_URL)으로 바꿔 넣음
+const CFG = /*CFG*/{"wsPort": 8770, "backendUrl": ""}/*CFG*/;
+$('url').value = `ws://${location.hostname || 'localhost'}:${CFG.wsPort}`;
 $('mid').value = 'm_' + new Date().toISOString().replace(/\D/g, '').slice(0, 14);
 const log = s => { $('log').textContent += new Date().toLocaleTimeString() + '  ' + s + '\n'; $('log').scrollTop = 1e9; };
 let ws = null, ctx = null, stream = null, node = null, paused = false, ended = true;
@@ -111,7 +113,7 @@ $('bDrop').onclick = () => {   // 장애 흉내: 끊은 동안 소리는 backlog
 setInterval(stat, 500);
 
 // ---- 자막: 가짜 백엔드의 자막 흐름을 구독 (실서비스에서는 백엔드가 WebSocket으로 내려줄 부분) ----
-$('burl').value = `http://${location.hostname || 'localhost'}:8767`;
+$('burl').value = CFG.backendUrl || `http://${location.hostname || 'localhost'}:8767`;
 const M = {};   // meetingId → {seq: segment}
 const fmt = ms => { const s = ms / 1000; return String(Math.floor(s / 60)).padStart(2, '0') + ':' + (s % 60).toFixed(1).padStart(4, '0'); };
 // ---- 지연: 회의 시각 → 그 소리를 받은 실제 시각, 자막이 처음 나온·확정된 실제 시각 ----

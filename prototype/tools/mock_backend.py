@@ -1,4 +1,4 @@
-"""시험용 가짜 백엔드: STT 서버(backend_sender.py)가 보내는 전사 줄을 받아, CN팀 2장 2.2 규칙대로 합쳐 화면에 보여줌.
+r"""시험용 가짜 백엔드: STT 서버(backend_sender.py)가 보내는 전사 줄을 받아, CN팀 2장 2.2 규칙대로 합쳐 화면에 보여줌.
 실제 meeting-service가 아님. STT 쪽 전송을 눈으로 확인하고, 백엔드가 받은 줄을 어떻게 합치면 되는지 보여주는 참고용.
 
 받는 곳  POST /internal/meetings/{meetingId}/transcripts   {"segments": [...]}
@@ -8,15 +8,18 @@
   - 화면·저장 순서는 startMs 기준 (seq는 시간 순서가 아님, 보완 줄이 앞 시각으로 늦게 옴)
 규칙 위반으로 세는 것: 옛 rev(지금 것 이하)가 온 경우, 확정 뒤 같은 seq가 다시 온 경우
 
-실행 (nineouting-stt/prototype 기준)
-  .venv/bin/python tools/mock_backend.py              → http://localhost:8767 (확인 화면)
-  .venv/bin/python app/server.py --device 2 --backend-url http://127.0.0.1:8767
+실행 (nineouting-stt/prototype 기준, 윈도우는 python 대신 .venv\Scripts\python, 맥은 .venv/bin/python)
+  python tools/mock_backend.py              → http://localhost:8767 (확인 화면, 포트는 --port 또는 .env MOCK_PORT)
+  python app/server.py --input ws --backend-url http://127.0.0.1:8767
 화면의 "10초 동안 실패" 버튼: 그동안 503으로 답해 STT의 재전송을 확인함
 """
-import argparse, json, queue, re, threading, time
+import argparse, json, os, queue, re, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-p = argparse.ArgumentParser(); p.add_argument('--port', type=int, default=8767); A = p.parse_args()
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'app'))
+from envfile import load_env  # noqa: E402
+load_env()
+p = argparse.ArgumentParser(); p.add_argument('--port', type=int, default=os.environ.get('MOCK_PORT', 8767)); A = p.parse_args()
 lock = threading.Lock()
 meetings = {}       # meetingId → {'seg': {seq: segment}, 'stats': {...}}
 reqlog = []         # 최근 요청

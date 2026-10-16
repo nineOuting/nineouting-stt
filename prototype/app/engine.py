@@ -31,7 +31,8 @@ import numpy as np
 import sherpa_onnx
 
 SR = 16000
-DEFAULT_MODELS = os.path.expanduser('~/Dev/nineouting-ref/stt_models')
+# 모델 폴더: 환경 변수 NINEOUTING_STT_MODELS가 있으면 그것, 없으면 prototype/models (tools/download_models.py가 받는 곳)
+DEFAULT_MODELS = os.environ.get('NINEOUTING_STT_MODELS') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'models')
 LOW_CONF = 0.3
 DEDUP_CHARS = 6   # 강제 분할 뒤 새 줄 앞에서 앞 줄 끝과 맞춰 볼 최대 글자 수
 
@@ -40,7 +41,7 @@ def make_rec(model_dir, chunk, method, endpoint=False, hotwords='', hotwords_sco
     st = f'-epoch-99-avg-1-chunk-{chunk}-left-128.int8.onnx'
     for f in (f'{model_dir}/tokens.txt', f'{model_dir}/encoder{st}'):
         if not os.path.exists(f):
-            raise FileNotFoundError(f'모델 파일 없음: {f} (--models로 경로 지정)')
+            raise FileNotFoundError(f'모델 파일 없음: {f} (python tools/download_models.py로 받거나 --models로 경로 지정)')
     return sherpa_onnx.OnlineRecognizer.from_transducer(
         tokens=f'{model_dir}/tokens.txt', encoder=f'{model_dir}/encoder{st}', decoder=f'{model_dir}/decoder{st}',
         joiner=f'{model_dir}/joiner{st}', num_threads=1, sample_rate=SR, feature_dim=80, decoding_method=method,
