@@ -1,7 +1,8 @@
 """실시간 전사 엔진: 메인 스트리밍 STT + VAD 보완 + 화자 번호 + 확신도 + 다른 인식 결과.
 
 설정 근거는 nineouting-ref/stt_eval/meeting2/stt_improve.md (SCRUM-23)와 scrum25_vad_recover.md (SCRUM-25).
-- STT: zipformer-174m chunk-64, modified_beam_search, 후보 4, 발화 끊기 2.4/0.8/20초
+- STT: zipformer-174m chunk-64, modified_beam_search, 후보 4, 발화 끊기 2.4/0.8/10초 + 1초 다시 넣기
+  (권장 설정은 아래 DEFAULTS 한 곳에 둠. Engine()을 옵션 없이 불러도 서버 기본값과 같은 결과가 나옴)
   (end_silence=말한 뒤 쉼, max_len=최대 길이. 최대 길이로 강제로 끊을 때는 걸쳐 있던 단어를 잃음 →
    overlap초만큼 직전 소리를 새 인식기에 다시 넣어 살림. 측정은 nineouting-ref review/endpoint_cut_check.py)
   다시 넣은 소리에서 앞 줄과 겹쳐 나온 글자는 새 줄 앞에서 뺌 (_trim): 실제 시각이 앞 줄 마지막 글자 이하인 글자 →
@@ -31,16 +32,20 @@ import numpy as np
 import sherpa_onnx
 
 SR = 16000
-DEFAULT_MODELS = os.path.expanduser('~/Dev/nineouting-ref/stt_models')
+# 모델 폴더: 환경 변수 NINEOUTING_STT_MODELS가 있으면 그것, 없으면 prototype/models (tools/download_models.py가 받는 곳)
+DEFAULT_MODELS = os.environ.get('NINEOUTING_STT_MODELS') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'models')
 LOW_CONF = 0.3
 DEDUP_CHARS = 6   # 강제 분할 뒤 새 줄 앞에서 앞 줄 끝과 맞춰 볼 최대 글자 수
+# 권장 설정 (근거: docs/notes.md "설정 근거"). Engine 기본값과 server.py 옵션 기본값이 모두 이 값을 씀
+DEFAULTS = dict(chunk='64', hotwords=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hotwords.txt'),
+                hotwords_score=1.0, blank_penalty=0.5, max_len=10.0, overlap=1.0)
 
 
 def make_rec(model_dir, chunk, method, endpoint=False, hotwords='', hotwords_score=1.0, end_silence=0.8, max_len=20.0, blank_penalty=0.0):
     st = f'-epoch-99-avg-1-chunk-{chunk}-left-128.int8.onnx'
     for f in (f'{model_dir}/tokens.txt', f'{model_dir}/encoder{st}'):
         if not os.path.exists(f):
-            raise FileNotFoundError(f'모델 파일 없음: {f} (--models로 경로 지정)')
+            raise FileNotFoundError(f'모델 파일 없음: {f} (python tools/download_models.py로 받거나 --models로 경로 지정)')
     return sherpa_onnx.OnlineRecognizer.from_transducer(
         tokens=f'{model_dir}/tokens.txt', encoder=f'{model_dir}/encoder{st}', decoder=f'{model_dir}/decoder{st}',
         joiner=f'{model_dir}/joiner{st}', num_threads=1, sample_rate=SR, feature_dim=80, decoding_method=method,
@@ -173,9 +178,10 @@ class AltWorker:
 
 
 class Engine:
-    def __init__(self, on_event, model_dir=None, vad_model=None, chunk='64', hotwords='', hotwords_score=1.0,
-                 wait=2.0, min_gap=0.5, recover=True, keep_seconds=120, spk_model=None, diar=True, alt=True,
-                 max_speakers=0, end_silence=0.8, max_len=20.0, overlap=0.0, blank_penalty=0.0):
+    def __init__(self, on_event, model_dir=None, vad_model=None, chunk=DEFAULTS['chunk'], hotwords=DEFAULTS['hotwords'],
+                 hotwords_score=DEFAULTS['hotwords_score'], wait=2.0, min_gap=0.5, recover=True, keep_seconds=120,
+                 spk_model=None, diar=True, alt=True, max_speakers=0, end_silence=0.8, max_len=DEFAULTS['max_len'],
+                 overlap=DEFAULTS['overlap'], blank_penalty=DEFAULTS['blank_penalty']):
         model_dir = model_dir or f'{DEFAULT_MODELS}/zipformer-174m'
         vad_model = vad_model or f'{DEFAULT_MODELS}/speaker/silero_vad.onnx'
         if not os.path.exists(vad_model):

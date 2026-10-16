@@ -1,17 +1,18 @@
-"""회의 실시간 전사 웹 화면 (로컬 전용).
+r"""회의 실시간 전사 웹 화면 (로컬 전용).
 
 마이크 또는 wav를 엔진에 넣고, 이벤트를 SSE로 브라우저에 보냄.
-http://localhost:8765 에서 열림. 외부로 보내지 않음. 녹음은 저장하지 않음.
-마이크 입력: 기본은 sounddevice(CoreAudio). ffmpeg avfoundation 입력은 말할 때 틱 잡음이 생겨(맥 내장 마이크, 2026-10-14
-  진 청취) --input ffmpeg 일 때만 씀. 같은 날 서버 세션들에서 실제 시간 대비 소리가 약 11% 빠졌음 (원인 확인용 --diag)
+http://localhost:8765 에서 열림. 녹음은 화면의 "녹음 시작"을 눌렀을 때만 이 컴퓨터에 저장함.
+--backend-url·--summary-url을 주면 그 주소로 전사를 보냄 (--input ws면 브라우저가 WebSocket으로 보내는 소리를 받음).
+마이크 입력: sounddevice (윈도우·맥 공통). 예전 ffmpeg 입력은 틱 잡음·소리 빠짐 문제로 지움 (docs/notes.md)
 
-실행 (nineouting-stt/prototype 기준)
-  마이크 장치 목록:  .venv/bin/python app/server.py --list-devices
-  마이크로 전사:     .venv/bin/python app/server.py            (시스템 기본 입력. 장치를 고르려면 --device 번호)
-  입력 상태 진단:    .venv/bin/python app/server.py --diag     (30초마다 받은 소리·읽기 대기·처리 시간을 터미널에 출력)
-  wav로 시험:       .venv/bin/python app/server.py --wav ~/Dev/nineouting-ref/stt_eval/own/eval_own_01.wav
+실행 (nineouting-stt/prototype 기준, 윈도우는 python 대신 .venv\Scripts\python, 맥은 .venv/bin/python)
+  마이크 장치 목록:  python app/server.py --list-devices
+  마이크로 전사:     python app/server.py            (시스템 기본 입력. 장치를 고르려면 --device 번호)
+  입력 상태 진단:    python app/server.py --diag     (30초마다 받은 소리·읽기 대기·처리 시간을 터미널에 출력)
+  wav로 시험:       python app/server.py --wav 녹음.wav     (16kHz 모노 16비트, 실제 속도로 넣음)
   전사문 저장:       자동. 세션마다 transcripts/날짜_시각.jsonl 에 줄이 바뀔 때마다 저장 (--save-dir로 폴더, --out으로 첫 세션 파일 지정)
-종료: Ctrl+C (이 프로그램이 띄운 ffmpeg만 종료)
+종료: Ctrl+C
+주소·포트 설정: prototype/.env (.env.example을 복사). 값을 정하는 순서는 명령 옵션 > 환경 변수 > .env > 기본값
 
 세션 (화면 버튼)
   서버를 켜면 세션 1이 시작되고 바로 전사함. 녹음은 하지 않음
@@ -27,63 +28,67 @@ http://localhost:8765 에서 열림. 외부로 보내지 않음. 녹음은 저�
 브라우저 입력 (--input ws, CN팀 2장 2.1 검토 확정)
   회의록 작성자 브라우저가 16kHz 모노 16비트 PCM 100ms 조각과 start·pause·resume·end(JSON)를 WebSocket으로 보냄 (규약은 ws_handler 위 설명)
   서버를 켜면 대기하다가 start를 받으면 그 meetingId로 세션을 엶. 시험용 보내는 화면: http://localhost:8765/sender
-  실행: .venv/bin/python app/server.py --input ws --backend-url http://127.0.0.1:8767
+  실행: python app/server.py --input ws --backend-url http://127.0.0.1:8767
 
 백엔드 전송 (backend_sender.py, CN팀 2장 2.2 + AI팀 추가 필드, 2026-10-15 확정)
   말하는 중·확정·보완 줄을 --backend-period초(기본 0.5)마다 바뀐 것만 POST {--backend-url}/internal/meetings/{meeting_id}/transcripts
   화면에서 고치거나 지운 것은 보내지 않음 (정식 서비스에서는 백엔드가 처리). 발화자 구분은 하지 않아 화자 번호는 보내지 않음
   --backend-url이 없으면 세션 파일 옆 <이름>.backend.jsonl 에만 기록
 """
-import argparse, datetime, json, os, queue, shutil, signal, subprocess, sys, threading, time, wave
+import argparse, datetime, json, os, queue, re, signal, sys, threading, time, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from engine import Engine, SR, DEFAULT_MODELS, line_kind  # noqa: E402
+from envfile import load_env  # noqa: E402
+ENV_LOADED = load_env()   # engine의 모델 폴더 기본값(NINEOUTING_STT_MODELS)도 .env를 따르도록 engine보다 먼저
+from engine import Engine, SR, DEFAULT_MODELS, DEFAULTS, line_kind  # noqa: E402
 from summary_sender import Sender  # noqa: E402
 from backend_sender import BackendSender  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 p = argparse.ArgumentParser()
-p.add_argument('--input', default='sd', choices=['sd', 'ffmpeg', 'ws'],
-               help='입력 방식 (sd=sounddevice 마이크, ffmpeg=avfoundation 마이크, ws=브라우저가 WebSocket으로 보내는 소리)')
-p.add_argument('--ws-host', default='127.0.0.1', help='--input ws: WebSocket 받는 주소')
-p.add_argument('--ws-port', type=int, default=8770, help='--input ws: WebSocket 포트. 시험용 보내는 화면은 http://localhost:<--port>/sender')
-p.add_argument('--device', default='', help='마이크 장치 번호 (--list-devices). 없으면 sd는 시스템 기본 입력, ffmpeg는 0')
+p.add_argument('--input', default='sd', choices=['sd', 'ws'],
+               help='입력 방식 (sd=이 컴퓨터 마이크, ws=브라우저가 WebSocket으로 보내는 소리)')
+p.add_argument('--host', default=os.environ.get('STT_HOST', '127.0.0.1'),
+               help='화면 서버가 접속을 받는 범위 (.env STT_HOST). 127.0.0.1=이 컴퓨터만, 0.0.0.0=네트워크 전체')
+p.add_argument('--ws-host', default=os.environ.get('WS_HOST', '127.0.0.1'), help='--input ws: WebSocket이 접속을 받는 범위 (.env WS_HOST)')
+p.add_argument('--ws-port', type=int, default=os.environ.get('WS_PORT', 8770), help='--input ws: WebSocket 포트 (.env WS_PORT)')
+p.add_argument('--device', default='', help='마이크 장치 번호 (--list-devices). 없으면 시스템 기본 입력')
 p.add_argument('--list-devices', action='store_true')
 p.add_argument('--diag', action='store_true', help='30초마다 입력 상태(실제 시간 대비 받은 소리, 읽기 대기, 처리 시간)를 터미널에 출력. '
                '없어도 마이크 소리가 빠지면(최근 30초 1%% 이상, 입력 넘침) 경고 한 줄은 나옴')
-p.add_argument('--wav', default=''); p.add_argument('--port', type=int, default=8765)
-p.add_argument('--models', default=DEFAULT_MODELS, help='stt_models 폴더 (기본: nineouting-ref/stt_models)')
-p.add_argument('--chunk', default='64', choices=['16', '64'])
-p.add_argument('--hotwords', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hotwords.txt'),
+p.add_argument('--wav', default=''); p.add_argument('--port', type=int, default=os.environ.get('STT_PORT', 8765), help='화면 포트 (.env STT_PORT)')
+p.add_argument('--models', default=DEFAULT_MODELS, help='모델 폴더 (기본: prototype/models, .env NINEOUTING_STT_MODELS). 받기: python tools/download_models.py')
+p.add_argument('--chunk', default=DEFAULTS['chunk'], choices=['16', '64'])
+p.add_argument('--hotwords', default=DEFAULTS['hotwords'],
                help="핫워드(회의 용어) 파일. 기본 app/hotwords.txt 31개. 끄려면 --hotwords ''")
-p.add_argument('--hotwords-score', type=float, default=1.0)
-p.add_argument('--blank-penalty', type=float, default=0.5, help='글자 안 냄(blank)에 주는 벌점. 빠지는 말이 줄고 틀린·낀 글자가 조금 늚. 0이면 끔 (1.0부터 삽입 급증)')
+p.add_argument('--hotwords-score', type=float, default=DEFAULTS['hotwords_score'])
+p.add_argument('--blank-penalty', type=float, default=DEFAULTS['blank_penalty'], help='글자 안 냄(blank)에 주는 벌점. 빠지는 말이 줄고 틀린·낀 글자가 조금 늚. 0이면 끔 (1.0부터 삽입 급증)')
 p.add_argument('--no-recover', action='store_true'); p.add_argument('--out', default='', help='첫 세션 전사 파일 경로 (기본: 자동 이름)')
 p.add_argument('--save-dir', default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'transcripts'),
                help='세션 전사·녹음 파일 폴더 (기본: prototype/transcripts, 깃 제외)')
 p.add_argument('--no-diar', action='store_true', help='화자 번호 표시 끄기')
 p.add_argument('--no-alt', action='store_true', help='다른 인식 결과 끄기 (메모리 약 300MB 절약, 추정)')
 p.add_argument('--max-speakers', type=int, default=0, help='참석자 수 (0이면 자동). 화면에서도 바꿀 수 있음')
-p.add_argument('--max-len', type=float, default=10.0, help='한 줄 최대 길이(초). 쉼 없이 길게 말하면 이 길이에서 끊음 (이전 20)')
-p.add_argument('--overlap', type=float, default=1.0, help='최대 길이로 끊을 때 직전 소리를 새 줄에 다시 넣는 길이(초). 걸친 단어를 살리는 대신 앞뒤 줄에 겹칠 수 있음. 0이면 끔')
+p.add_argument('--max-len', type=float, default=DEFAULTS['max_len'], help='한 줄 최대 길이(초). 쉼 없이 길게 말하면 이 길이에서 끊음 (이전 20)')
+p.add_argument('--overlap', type=float, default=DEFAULTS['overlap'], help='최대 길이로 끊을 때 직전 소리를 새 줄에 다시 넣는 길이(초). 걸친 단어를 살리는 대신 앞뒤 줄에 겹칠 수 있음. 0이면 끔')
 p.add_argument('--summary-url', default='', help='요약 쪽 받는 주소 (예: http://localhost:8000/stt). 없으면 outbox 파일에만 기록')
 p.add_argument('--send-period', type=float, default=10.0, help='요약 쪽 전송 주기(초)')
-p.add_argument('--backend-url', default='', help='백엔드 주소 (예: http://meeting-service:8080). 없으면 backend.jsonl 파일에만 기록')
+p.add_argument('--backend-url', default=os.environ.get('BACKEND_URL', ''),
+               help='백엔드 주소 (.env BACKEND_URL, 예: http://meeting-service:8080). 없으면 backend.jsonl 파일에만 기록')
 p.add_argument('--backend-period', type=float, default=0.5, help='백엔드 전송 주기(초). 그사이 바뀐 줄만 보냄')
 p.add_argument('--meeting-id', default='', help='첫 회의의 meeting_id (앱이 줄 값. 없으면 자동)')
 A = p.parse_args()
 
-FFMPEG = shutil.which('ffmpeg')
-if A.list_devices and A.input == 'sd':
+if A.list_devices:
     import sounddevice as sd
     for i, d in enumerate(sd.query_devices()):
         if d['max_input_channels'] > 0:
             print(f'[{i}] {d["name"]} (입력 {d["max_input_channels"]}채널, {d["default_samplerate"]:.0f}Hz)' + (' ← 기본' if i == sd.default.device[0] else ''))
     sys.exit(0)
 if A.input == 'sd' and not A.wav and A.device:
-    # 장치 번호가 ffmpeg 시절과 달라 마이크가 아닌 장치를 고르기 쉬움 → 열기 전에 확인하고 마이크 목록을 알려 줌
+    # 스피커 등 마이크가 아닌 장치를 고르기 쉬움 → 열기 전에 확인하고 마이크 목록을 알려 줌
     import sounddevice as sd
     devs = sd.query_devices()
     mics = ', '.join(f'[{i}] {d["name"]}' for i, d in enumerate(devs) if d['max_input_channels'] > 0)
@@ -93,10 +98,21 @@ if A.input == 'sd' and not A.wav and A.device:
         sys.exit(f'장치 {A.device!r}를 찾지 못함. 마이크: {mics} (--list-devices)')
     if info['max_input_channels'] < 1:
         sys.exit(f'장치 {A.device}번 {info["name"]!r}는 마이크가 아님. 마이크: {mics} (--list-devices)')
-if A.list_devices:
-    if not FFMPEG: sys.exit('ffmpeg를 찾지 못함')
-    r = subprocess.run([FFMPEG, '-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''], capture_output=True, text=True)
-    print('\n'.join(l for l in r.stderr.splitlines() if 'AVFoundation' in l)); sys.exit(0)
+
+# ---- 모델 확인: 필수가 없으면 받는 방법을 알려 주고 끝냄, 선택이 없으면 그 기능만 끔 ----
+_st = 'epoch-99-avg-1-chunk-{}-left-128.int8.onnx'
+_need = [f'zipformer-174m/tokens.txt', f'zipformer-174m/encoder-{_st.format(A.chunk)}', f'zipformer-174m/decoder-{_st.format(A.chunk)}',
+         f'zipformer-174m/joiner-{_st.format(A.chunk)}'] + ([] if A.no_recover else ['speaker/silero_vad.onnx'])
+_missing = [f for f in _need if not os.path.exists(os.path.join(A.models, f))]
+if _missing:
+    sys.exit(f'모델 파일이 없음 ({A.models}):\n  ' + '\n  '.join(_missing) +
+             '\n받기: python tools/download_models.py  (prototype 폴더에서 실행. 다른 폴더의 모델을 쓰려면 --models 경로)')
+if not A.no_alt and not os.path.exists(os.path.join(A.models, f'zipformer-174m/encoder-{_st.format(16)}')):
+    A.no_alt = True
+    print('다른 인식 결과용 모델(chunk-16)이 없어 이 기능을 끔. 쓰려면 python tools/download_models.py --alt', file=sys.stderr, flush=True)
+if not A.no_diar and not os.path.exists(os.path.join(A.models, 'speaker/nemo_en_titanet_small.onnx')):
+    A.no_diar = True
+    print('화자 번호용 모델(TitaNet)이 없어 이 기능을 끔. 쓰려면 python tools/download_models.py --diar', file=sys.stderr, flush=True)
 
 # ---- 이벤트 저장·배포 ----
 lock = threading.RLock()   # 요약 전송 알림이 publish 안에서 다시 publish를 부를 수 있어 재진입 허용
@@ -341,8 +357,6 @@ def ws_read():
 
 # ---- 소리 입력 스레드 ----
 stop = threading.Event()
-proc = None
-ffmpeg_err = []     # ffmpeg 메시지 (평소엔 숨기고, 예기치 않게 멈췄을 때만 보여줌)
 
 
 def audio_loop():
@@ -359,7 +373,7 @@ class Diag:
     --diag: 30초마다 출력. 없으면 최근 30초에 빠진 소리가 1% 이상이거나 입력 넘침이 새로 생겼을 때만 경고 한 줄"""
     def __init__(self, q=None, flags=None, verbose=False):
         self.q, self.flags, self.verbose = q, flags or {}, verbose
-        self.last = self.t_rep = time.perf_counter(); self.n_err = 0
+        self.last = self.t_rep = time.perf_counter()
         self.wall = self.got = self.read = self.feed = self.pub = self.rec = 0.0; self.n = self.instant = 0; self.maxq = 0
         self.prev = (0.0, 0.0, 0)   # 지난 출력 때의 (실행 시간, 받은 소리, 입력 넘침)
 
@@ -385,13 +399,11 @@ class Diag:
                    f'(바로 읽힘 {self.instant / max(self.n, 1) * 100:.0f}%) · 엔진 {self.feed - self.pub:.1f}초 · 알림·저장 {self.pub:.1f}초 · 녹음 쓰기 {self.rec:.1f}초')
             if self.q is not None: msg += f' · 대기열 최대 {self.maxq * 0.1:.1f}초'
             if self.flags: msg += ' · ' + ', '.join(f'{k} {v}' for k, v in self.flags.items())
-            new = ffmpeg_err[self.n_err:]; self.n_err = len(ffmpeg_err)
-            if new: msg += ' · ffmpeg: ' + ' / '.join(new[-3:])
             print(msg, file=sys.stderr, flush=True)
 
 
 def _audio_loop():
-    global proc, ENGINE
+    global ENGINE
     eng = ENGINE = Engine(publish, max_speakers=A.max_speakers, model_dir=f'{A.models}/zipformer-174m', vad_model=f'{A.models}/speaker/silero_vad.onnx',
                  chunk=A.chunk, hotwords=A.hotwords, hotwords_score=A.hotwords_score, recover=not A.no_recover,
                  spk_model=f'{A.models}/speaker/nemo_en_titanet_small.onnx', diar=not A.no_diar, alt=not A.no_alt,
@@ -407,8 +419,8 @@ def _audio_loop():
         status['source'] = f'WebSocket ws://{A.ws_host}:{A.ws_port}'
         print(f'WebSocket 입력 대기: ws://{A.ws_host}:{A.ws_port}  시험용 보내는 화면: http://localhost:{A.port}/sender', file=sys.stderr, flush=True)
         read = ws_read
-    elif A.input == 'sd':
-        # CoreAudio가 자기 스레드에서 0.1초 조각을 대기열에 넣음 → 처리가 잠깐 늦어도 입력이 버려지지 않음
+    else:
+        # 운영체제 오디오(PortAudio)가 자기 스레드에서 0.1초 조각을 대기열에 넣음 → 처리가 잠깐 늦어도 입력이 버려지지 않음
         import sounddevice as sd
         dev = int(A.device) if A.device.isdigit() else (A.device or None)
         sdq = queue.Queue(); flags = {'입력 넘침': 0}
@@ -424,14 +436,6 @@ def _audio_loop():
                 except queue.Empty:
                     if not stream.active: raise RuntimeError('마이크 입력이 멈춤 (장치 연결을 확인)')
             return b''
-    else:
-        # 별도 프로세스 그룹: 터미널 Ctrl+C가 ffmpeg에 직접 가지 않고, 서버가 정상 종료('q')시킴
-        proc = subprocess.Popen([FFMPEG, '-hide_banner', '-loglevel', 'warning' if A.diag else 'error', '-f', 'avfoundation',
-                                 '-i', f':{A.device or 0}', '-ac', '1', '-ar', str(SR), '-f', 's16le', '-'],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-        threading.Thread(target=lambda: ffmpeg_err.extend(l.decode(errors='replace').rstrip() for l in proc.stderr),
-                         daemon=True).start()
-        read = lambda: proc.stdout.read(3200)
     # 마이크 입력은 항상 지켜봄 (문제 있을 때만 경고). WebSocket 입력은 브라우저가 멈추거나 끊긴 동안도 시간이 흘러 빠짐으로 잘못 세므로 --diag일 때만
     D = Diag(sdq, flags, verbose=A.diag) if (A.diag or (not A.wav and A.input != 'ws')) else None
     if D:   # 엔진이 부르는 화면 알림·파일 저장 시간을 따로 셈 (다른 결과 스레드의 알림은 세지 않음)
@@ -453,12 +457,7 @@ def _audio_loop():
                 time.sleep(0.1); continue
             tr = time.perf_counter(); b = read()
             if b is None: continue   # WebSocket: 소리가 아직 없거나 제어 메시지를 넘김
-            if not b:
-                if proc and not stop.is_set():  # 서버가 끄지 않았는데 ffmpeg가 멈춤 → 원인 메시지를 보여줌
-                    time.sleep(0.2)
-                    msg = ' / '.join(ffmpeg_err[-3:]) or f'ffmpeg 종료 (코드 {proc.poll()})'
-                    raise RuntimeError(f'마이크 입력이 멈춤: {msg}')
-                break
+            if not b: break
             c = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768
             if A.wav:  # 실제 속도로
                 d = fed + len(c) / SR - (time.perf_counter() - t0)
@@ -486,6 +485,8 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/sender':   # 시험용 보내는 화면 (마이크 → WebSocket, --input ws와 함께 씀)
             body = open(os.path.join(os.path.dirname(STATIC), '..', 'tools', 'mic_sender.html'), 'rb').read()
+            cfg = json.dumps({'wsPort': A.ws_port, 'backendUrl': A.backend_url.rstrip('/')}).encode()
+            body = re.sub(rb'/\*CFG\*/.*?/\*CFG\*/', lambda m: cfg, body, count=1)   # 화면이 실제 포트·자막 주소를 쓰게
             self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
         elif self.path in ('/', '/index.html'):
@@ -597,27 +598,19 @@ class H(BaseHTTPRequestHandler):
 
 def main():
     th = threading.Thread(target=audio_loop, daemon=True); th.start()
-    srv = ThreadingHTTPServer(('127.0.0.1', A.port), H); srv.daemon_threads = True
-    print(f'http://localhost:{A.port}  입력: {status["source"]}  (Ctrl+C로 종료)', flush=True)
+    srv = ThreadingHTTPServer((A.host, A.port), H); srv.daemon_threads = True
+    if ENV_LOADED: print(f'설정 파일: {ENV_LOADED}', flush=True)
+    print(f'http://localhost:{A.port}  입력: {status["source"]}  (Ctrl+C로 종료)'
+          + (f'  접속 범위: {A.host}' if A.host != '127.0.0.1' else ''), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        # 정리(마이크 끄기·저장)는 최대 약 10초. 그 사이 Ctrl+C를 또 누르면 저장이 끊기므로 무시함 (강제 종료는 Ctrl+\)
+        # 정리(마이크 끄기·저장)는 최대 약 10초. 그 사이 Ctrl+C를 또 누르면 저장이 끊기므로 무시함 (강제 종료는 맥 Ctrl+\, 윈도우는 터미널 창 닫기)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         print('\n끄는 중… 녹음·전사 파일을 저장하고 있으니 잠시 기다려 주세요 (최대 약 10초)', flush=True)
         stop.set()
-        if proc and proc.poll() is None:  # 이 프로그램이 띄운 ffmpeg만 종료: 먼저 정상 종료('q'), 안 되면 신호
-            try:
-                proc.stdin.write(b'q'); proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                pass
-            try: proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.terminate()
-                try: proc.wait(timeout=2)
-                except subprocess.TimeoutExpired: proc.kill()
         th.join(timeout=5)
         with lock:
             rec_close()
