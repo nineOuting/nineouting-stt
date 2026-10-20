@@ -1,7 +1,7 @@
 # STT 이미지를 만들어 GHCR(ghcr.io/nineouting/nineouting-stt)에 올림.
 # 같은 조직 레포라 따로 받을 자격증명이 없고, 아래 permissions와 기본 GITHUB_TOKEN이면 됨.
 #
-# 태그: 커밋 SHA(어느 커밋에서 나온 이미지인지 바로 보임) + 브랜치 이름 + develop이면 latest
+# 태그: 브랜치 이름 + 커밋 SHA. 백엔드 서비스 레포의 ci.yml과 같은 모양
 # 끌어 쓰기: docker pull ghcr.io/nineouting/nineouting-stt:develop
 name: image
 
@@ -40,30 +40,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 태그 정하기
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=sha,format=long
-            type=ref,event=branch
-            type=raw,value=latest,enable={{is_default_branch}}
-
+      # 태그는 백엔드 서비스(nineouting-meeting-service의 ci.yml)와 같은 모양으로 맞춤:
+      # 브랜치 이름 + 커밋 SHA(접두사 없이)
       - name: 만들어서 올리기
         uses: docker/build-push-action@v6
         with:
           context: prototype
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.IMAGE }}:develop
+            ${{ env.IMAGE }}:${{ github.sha }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: 이미지 크기
         if: github.event_name != 'pull_request'
         run: |
-          docker pull "${IMAGE}:sha-${GITHUB_SHA}"
+          docker pull "${IMAGE}:${GITHUB_SHA}"
           docker image ls "${IMAGE}" --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
 
   # 태그가 붙지 않은 옛 이미지를 치움 (모델 층이 바뀔 때마다 쌓이므로)
