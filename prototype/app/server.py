@@ -348,6 +348,12 @@ def ws_handler(conn):
                 if not mid.isdigit():   # 백엔드 회의 번호는 숫자뿐 (CN팀 S5). 틀린 번호로 전사가 나가지 않게 연결을 끊음
                     say(type='error', message='meetingId 없음' if not mid else 'meetingId는 숫자여야 함')
                     conn.close(1008, 'meetingId must be numeric'); return
+                if auth and not (mid == str(auth['meetingId']) == str(auth['pathMeetingId'])):
+                    # 연결 주소·start 메시지·입장권 확인 응답의 meetingId가 모두 같아야 함 (CN팀 S1)
+                    print(f'meetingId가 어긋나 연결을 거절함: 주소 {auth["pathMeetingId"]} · '
+                          f'start {mid} · 입장권 {auth["meetingId"]}', file=sys.stderr, flush=True)
+                    say(type='error', message='meetingId가 연결 주소·입장권과 다름')
+                    conn.close(1008, 'meetingId mismatch'); return
                 if mid == WS['meeting']:                     # 같은 회의로 다시 연결
                     gap = off - WS['ms']
                     if gap > 0:                              # 빈 시간은 무음으로 채워 시각을 맞춤

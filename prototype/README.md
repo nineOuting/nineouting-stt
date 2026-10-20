@@ -121,6 +121,10 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 
 - 백엔드: `POST {backend-url}/internal/meetings/{meetingId}/transcripts`, 본문 `{"segments": [...]}`. 0.5초마다 바뀐 줄만 보내고, 실패하면 다음 주기에 다시 보냄. 필드 설명은 `app/backend_sender.py` 첫머리
 - 브라우저 → STT (WebSocket, `ws://localhost:8770`)
+  - 연결 주소: `/ws/stt/meetings/{meetingId}?ticket=…` (Gateway를 거쳐도 경로가 그대로 옴)
+  - 입장권 확인: 연결을 받으면 STT가 `POST {backend-url}/internal/stt-tickets/{ticket}/consume`을 한 번 부름. 401이거나 백엔드가 3초 안에 답하지 못하면 `1008`로 거절. 연결 주소·`start` 메시지·확인 응답의 `meetingId`가 **모두 같아야** 받아들임
+    - 입장권은 30초 유효하고 한 번 쓰면 지워짐. 다시 연결할 때는 브라우저가 새로 받아 와야 함
+    - `--backend-url`이 없거나 `--no-ticket`이면 확인하지 않음 (백엔드 없이 `/sender`로 시험할 때)
   - 소리: 바이너리로 16kHz 모노 16비트 PCM(little-endian), 100ms(3,200바이트)씩
   - 제어(JSON): `{"type":"start","meetingId":"…","offsetMs":0}`, `{"type":"pause"}`, `{"type":"resume"}`, `{"type":"end"}`
   - 응답(JSON): `ready`(서버가 받은 그 회의 소리 길이 `meetingMs`), `ended`, `error`
