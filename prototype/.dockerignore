@@ -1,0 +1,9 @@
+# 이미지에 들어가면 안 되는 것 (모델은 빌드할 때 받고, 전사·녹음은 회의 내용임)
+models/
+transcripts/
+.venv/
+.env
+__pycache__/
+*.pyc
+docs/
+README.md
