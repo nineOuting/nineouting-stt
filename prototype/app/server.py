@@ -21,9 +21,8 @@ http://localhost:8765 에서 열림. 녹음은 화면의 "녹음 시작"을 눌�
   완료: 세션을 닫고 대기. 닫은 세션의 줄을 고치면 그 파일에 반영됨. 대기에서 녹음 시작 → 화면을 비우고 새 세션 파일
   시각: 줄의 start·end는 서버 시작 뒤 엔진에 넣은 소리 기준 초 (멈춘 동안은 늘지 않음). wav 안의 시각 = start - wav_t0 (파일 첫 줄 _meta)
 
-요약 쪽 전송 (summary_sender.py, 2026-10-14 회의에서 정한 형식)
-  세션 = 회의. 세션마다 meeting_id를 붙이고, 확정 줄을 --send-period초(기본 10)마다 묶어 보냄. 시작·멈춤·재개·끝 알림은 바로 보냄
-  --summary-url이 없으면 세션 파일 옆 <이름>.outbox.jsonl 에만 기록
+회의 알림 (backend_sender.py, CN팀 S2 2026-10-20)
+  세션 = 회의. 시작·멈춤·재개·끝을 백엔드로 바로 보냄. AI 서비스로는 백엔드가 넘김 (STT에서 직접 보내던 경로는 없앰)
 
 브라우저 입력 (--input ws, CN팀 2장 2.1 검토 확정)
   회의록 작성자 브라우저가 16kHz 모노 16비트 PCM 100ms 조각과 start·pause·resume·end(JSON)를 WebSocket으로 보냄 (규약은 ws_handler 위 설명)
@@ -43,7 +42,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from envfile import load_env  # noqa: E402
 ENV_LOADED = load_env()   # engine의 모델 폴더 기본값(NINEOUTING_STT_MODELS)도 .env를 따르도록 engine보다 먼저
 from engine import Engine, SR, DEFAULT_MODELS, DEFAULTS, line_kind  # noqa: E402
-from summary_sender import Sender  # noqa: E402
 from backend_sender import BackendSender  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
@@ -73,12 +71,10 @@ p.add_argument('--no-alt', action='store_true', help='다른 인식 결과 끄�
 p.add_argument('--max-speakers', type=int, default=0, help='참석자 수 (0이면 자동). 화면에서도 바꿀 수 있음')
 p.add_argument('--max-len', type=float, default=DEFAULTS['max_len'], help='한 줄 최대 길이(초). 쉼 없이 길게 말하면 이 길이에서 끊음 (이전 20)')
 p.add_argument('--overlap', type=float, default=DEFAULTS['overlap'], help='최대 길이로 끊을 때 직전 소리를 새 줄에 다시 넣는 길이(초). 걸친 단어를 살리는 대신 앞뒤 줄에 겹칠 수 있음. 0이면 끔')
-p.add_argument('--summary-url', default='', help='요약 쪽 받는 주소 (예: http://localhost:8000/stt). 없으면 outbox 파일에만 기록')
-p.add_argument('--send-period', type=float, default=10.0, help='요약 쪽 전송 주기(초)')
 p.add_argument('--backend-url', default=os.environ.get('BACKEND_URL', ''),
-               help='백엔드 주소 (.env BACKEND_URL, 예: http://meeting-service:8080). 없으면 backend.jsonl 파일에만 기록')
+               help='백엔드 주소 (.env BACKEND_URL, 예: http://meeting-service:8083). 없으면 backend.jsonl 파일에만 기록')
 p.add_argument('--backend-period', type=float, default=0.5, help='백엔드 전송 주기(초). 그사이 바뀐 줄만 보냄')
-p.add_argument('--meeting-id', default='', help='첫 회의의 meeting_id (앱이 줄 값. 없으면 자동)')
+p.add_argument('--meeting-id', default='', help='첫 회의의 회의 번호 (백엔드가 쓰는 숫자). 없으면 자동 이름을 붙이고 백엔드로는 보내지 않음')
 A = p.parse_args()
 
 if A.list_devices:
@@ -123,9 +119,8 @@ status = {'source': A.wav or (f'WebSocket ws://{A.ws_host}:{A.ws_port}' if A.inp
           'state': 'run', 'rec': False, 'rec_sec': 0.0, 'session': ''}   # state: run(전사 중) / pause(일시정지) / idle(완료 후 대기)
 ENGINE = None       # 화면에서 화자 합치기·참석자 수를 바꿀 때 씀
 manual_seq = 0      # 직접 추가한 줄 번호
-SENDER = Sender(A.summary_url, A.send_period, now=lambda: ENGINE.fed if ENGINE else 0.0,
-                log=lambda m: print(m, file=sys.stderr, flush=True), on_update=lambda ev: publish(ev))
-BACKEND = BackendSender(A.backend_url, A.backend_period, log=lambda m: print(m, file=sys.stderr, flush=True))
+BACKEND = BackendSender(A.backend_url, A.backend_period, now=lambda: ENGINE.fed if ENGINE else 0.0,
+                        log=lambda m: print(m, file=sys.stderr, flush=True), on_update=lambda ev: publish(ev))
 
 
 clear_at = -1.0     # 마지막으로 지운 오디오 시각. 이보다 앞에서 시작한 보완 줄은 나중에 도착해도 버림
@@ -141,12 +136,7 @@ def publish(ev):
         if ev['type'] == 'partial':
             partial = ev
             if not CATCHUP[0]: BACKEND.partial(ev)   # 몰아 보내는 동안은 확정 줄만 보냄
-        elif ev['type'] in ('send', 'send_pending'):   # 요약 전송 상태창. 보낸 줄·수정에 묶음 번호를 붙여 둠 (새로 접속한 화면용)
-            m = ev.get('entry', {}).get('msg', {})
-            for x in m.get('lines', []):
-                if x['id'] in lines: lines[x['id']]['sent_seq'] = m['seq']
-            for x in m.get('edits', []):
-                if x['id'] in lines: lines[x['id']]['edit_sent_seq'] = m['seq']
+        elif ev['type'] == 'send':   # 백엔드 전송 상태창 (줄에는 표시하지 않음. 0.5초마다 나가서 거의 바로 보냄)
             for q in clients: q.put(ev)
             return
         elif ev['type'] == 'status':
@@ -154,10 +144,7 @@ def publish(ev):
         elif ev['type'] == 'alt':  # 이미 있는 줄에 다른 인식 결과를 붙임 (새로 접속한 화면에도 보내기 위해)
             if ev['id'] not in lines: return   # 지운 줄에 늦게 온 결과는 버림
             lines[ev['id']]['alts'] = ev['alts']
-        elif ev['type'] == 'clear':  # 전사 기록 지우기 (모든 화면에 알림)
-            if not ev.get('session_switch'):   # 같은 회의 안에서 지우면 요약 쪽에도 삭제로 알림 (새 회의로 넘어갈 때는 알리지 않음)
-                for ln in lines.values():
-                    if not ln.get('deleted'): SENDER.edit(ln['id'], ln.get('rev', 0) + 1, deleted=True)
+        elif ev['type'] == 'clear':  # 전사 기록 지우기 (모든 화면에 알림). 이미 보낸 줄은 백엔드에서 지우지 않음
             lines.clear(); partial = None; clear_at = status['audio_sec']; clear_id = ENGINE.next_id if ENGINE else 0
             if ENGINE: ENGINE.restart = True   # 지운 뒤에 한 말이 지우기 전 줄에 이어 붙어 버려지지 않게
         elif ev['type'] == 'merge':  # 화자 src를 dst로 합침: 지난 줄 번호를 모두 바꿈
@@ -175,18 +162,15 @@ def publish(ev):
                 ln['text'], ln['conf'], ln['edited'] = ev['text'], None, ev['source']
             ln['kind'] = line_kind(ln['text'])   # 고친 텍스트로 맞장구·간투사 다시 판별
             ln['rev'] = ln.get('rev', 0) + 1
-            SENDER.edit(ln['id'], ln['rev'], text=ln['text'], kind=ln['kind'])
             ev = {'type': 'edit', 'id': ev['id'], 'text': ln['text'], 'conf': ln['conf'],
                   'edited': ln.get('edited'), 'orig': ln['orig'], 'kind': ln['kind']}
-        elif ev['type'] == 'delete':  # 사용자가 줄을 지움. 파일에는 deleted로 남기고 화면·요약 쪽에서는 뺌
+        elif ev['type'] == 'delete':  # 사용자가 줄을 지움. 파일에는 deleted로 남기고 화면에서는 뺌
             ln = lines.get(ev['id'])
             if not ln or ln.get('deleted'): return
             ln['deleted'] = True; ln['rev'] = ln.get('rev', 0) + 1
-            SENDER.edit(ln['id'], ln['rev'], deleted=True)
         else:
             lines[ev['id']] = ev
             if partial and partial['id'] == ev['id']: partial = None
-            if ev['type'] in ('final', 'recovered', 'manual'): SENDER.line(ev)
             if ev['type'] in ('final', 'recovered'): BACKEND.line(ev)   # 직접 추가한 줄은 백엔드에서 생기므로 보내지 않음
         for q in clients: q.put(ev)
         if ev['type'] not in ('partial', 'status'): save_session()
@@ -205,7 +189,6 @@ def new_session(t0, path=None, mid=None):
     mid = mid or (A.meeting_id if A.meeting_id and SESS is None else '') or 'm_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     SESS = {'file': base, 'wav_path': None, 'wav': None, 'wav_t0': None, 't0': round(t0, 2), 'meeting_id': mid,
             'started': datetime.datetime.now().isoformat(timespec='seconds'), 'complete': False}
-    SENDER.start(mid, t0, os.path.splitext(base)[0] + '.outbox.jsonl')
     BACKEND.start(mid, t0, os.path.splitext(base)[0] + '.backend.jsonl')
     status['session'] = os.path.basename(base); status['rec'] = False; status['rec_sec'] = 0.0
 
@@ -244,6 +227,11 @@ def control(eng, act):
         z = np.zeros(1600, np.float32)
         for _ in range(25): eng.feed(z); rec_write(z)
         status['audio_sec'] = round(eng.fed, 1)
+
+    def mark_gap(at, to):   # 위 무음은 브라우저가 세는 회의 시간에 없음 → 보내는 시각에서 뺌
+        if A.input == 'ws' and not A.wav:
+            BACKEND.gap(at, to - at)
+            SESS.setdefault('gaps', []).append([round(at, 2), round(to - at, 2)])
     if isinstance(act, tuple) and act[0] == 'start':   # --input ws: 브라우저가 회의 시작을 알림 (meetingId, 회의 시작 기준 음성 초)
         _, mid, off = act
         if st in ('run', 'pause'): control(eng, 'complete')   # 다른 회의가 열려 있으면 닫음
@@ -264,16 +252,15 @@ def control(eng, act):
         SESS['wav'] = w; SESS['wav_t0'] = round(eng.fed - len(pre) / SR, 2); status['rec'] = True; status['rec_sec'] = 0.0
         rec_write(pre)
     elif act == 'pause' and st == 'run':
-        at = eng.fed; flush()
-        if A.input == 'ws' and not A.wav:   # 브라우저가 세는 회의 시간에는 이 무음이 없음 → 전송 시각에서 뺌
-            for s in (SENDER, BACKEND): s.gap(at, eng.fed - at)
-            SESS.setdefault('gaps', []).append([round(at, 2), round(eng.fed - at, 2)])
-        status['state'] = 'pause'; SENDER.event('pause'); BACKEND.flush()
+        at = eng.fed; flush(); mark_gap(at, eng.fed)
+        status['state'] = 'pause'; BACKEND.event('pause')
     elif act == 'resume' and st == 'pause':
-        status['state'] = 'run'; SENDER.event('resume')
+        status['state'] = 'run'; BACKEND.event('resume')
     elif act == 'complete' and st in ('run', 'pause'):
-        if st == 'run': flush()
-        rec_close(); status['state'] = 'idle'; status['rec'] = False; SENDER.event('end'); BACKEND.flush()
+        if st == 'run':
+            at = eng.fed; flush(); mark_gap(at, eng.fed)   # 마무리용 무음은 회의 시간에 넣지 않음 (end의 atMs가 커지지 않게)
+        rec_close(); status['state'] = 'idle'; status['rec'] = False
+        BACKEND.event('end', wait_lines=3.0)   # 남은 줄을 먼저 보낸 뒤 end (CN팀 S4). 3초 안에 못 비우면 그냥 보냄
         with lock: SESS['complete'] = True; save_session()
     else:
         return
@@ -330,8 +317,9 @@ def ws_handler(conn):
             t = m.get('type')
             if t == 'start':
                 mid = str(m.get('meetingId') or '').strip(); off = float(m.get('offsetMs') or 0)
-                if not mid:
-                    say(type='error', message='meetingId 없음'); continue
+                if not mid.isdigit():   # 백엔드 회의 번호는 숫자뿐 (CN팀 S5). 틀린 번호로 전사가 나가지 않게 연결을 끊음
+                    say(type='error', message='meetingId 없음' if not mid else 'meetingId는 숫자여야 함')
+                    conn.close(1008, 'meetingId must be numeric'); return
                 if mid == WS['meeting']:                     # 같은 회의로 다시 연결
                     gap = off - WS['ms']
                     if gap > 0:                              # 빈 시간은 무음으로 채워 시각을 맞춤
@@ -515,7 +503,7 @@ class H(BaseHTTPRequestHandler):
             q = queue.Queue()
             with lock:
                 hist = sorted((e for e in lines.values() if not e.get('deleted')), key=lambda e: e['start']) + ([partial] if partial else [])
-                hist.append({'type': 'send_init', 'history': list(SENDER.history), 'snap': SENDER.snapshot()})
+                hist.append({'type': 'send_init', 'history': list(BACKEND.history), 'snap': BACKEND.snapshot()})
                 clients.append(q)
             try:
                 self.wfile.write(f"event: hello\ndata: {json.dumps(status, ensure_ascii=False)}\n\n".encode())
@@ -630,8 +618,8 @@ def main():
         th.join(timeout=5)
         with lock:
             rec_close()
-            if SESS and not SESS['complete']: SENDER.event('end')   # 완료를 누르지 않고 끈 경우
             BACKEND.flush()
+            if SESS and not SESS['complete']: BACKEND.event('end', wait_lines=2.0)   # 완료를 누르지 않고 끈 경우
             if SESS:
                 save_session(); print(f'전사문 저장: {SESS["file"]}' + (f'  녹음: {SESS["wav_path"]}' if SESS['wav_path'] else ''))
         srv.server_close()

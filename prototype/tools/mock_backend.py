@@ -2,6 +2,8 @@ r"""시험용 가짜 백엔드: STT 서버(backend_sender.py)가 보내는 전�
 실제 meeting-service가 아님. STT 쪽 전송을 눈으로 확인하고, 백엔드가 받은 줄을 어떻게 합치면 되는지 보여주는 참고용.
 
 받는 곳  POST /internal/meetings/{meetingId}/transcripts   {"segments": [...]}
+         POST /internal/meetings/{meetingId}/events        {"event": "start"|"pause"|"resume"|"end", "atMs": 0}
+           같은 알림이 두 번 와도 한 번만 센다는 전제로, (event, atMs)가 같으면 중복으로 표시함
 합치는 규칙 (2.2 + AI팀 추가 필드, 2026-10-15 확정)
   - 같은 seq는 덮어씀 (이어 붙이지 않음). rev가 지금 것보다 클 때만 반영
   - final: true인 줄은 final: false로 덮지 않음
@@ -27,15 +29,33 @@ clients = []
 fail_until = 0.0
 t0 = time.monotonic(); last_req = [None]
 PATH = re.compile(r'^/internal/meetings/([^/]+)/transcripts$')
+EVPATH = re.compile(r'^/internal/meetings/([^/]+)/events$')
 
 
 def push(ev):
     for q in clients: q.put(ev)
 
 
+def mget(mid):
+    return meetings.setdefault(mid, {'seg': {}, 'events': [], 'seen_events': set(),
+                                     'stats': {'requests': 0, 'segments': 0, 'stale_rev': 0, 'after_final': 0,
+                                               'events': 0, 'dup_events': 0}})
+
+
+def apply_event(mid, ev):
+    """회의 알림. (event, atMs)가 같으면 중복으로 세고 한 번만 반영 (백엔드가 한 번만 처리한다는 전제)"""
+    m = mget(mid); st = m['stats']; st['requests'] += 1
+    key = (ev.get('event'), ev.get('atMs'))
+    if key in m['seen_events']:
+        st['dup_events'] += 1
+        return [f'중복 알림 {key[0]} atMs {key[1]}']
+    m['seen_events'].add(key); m['events'].append(ev); st['events'] += 1
+    return []
+
+
 def apply(mid, segs):
     """2.2 규칙으로 합침. 바뀐 줄과 위반 내용을 돌려줌"""
-    m = meetings.setdefault(mid, {'seg': {}, 'stats': {'requests': 0, 'segments': 0, 'stale_rev': 0, 'after_final': 0}})
+    m = mget(mid)
     st = m['stats']; st['requests'] += 1; changed, notes = [], []
     for s in segs:
         st['segments'] += 1
@@ -61,6 +81,19 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get('Content-Length') or 0); raw = self.rfile.read(n)
         if self.path == '/fail':
             fail_until = time.monotonic() + 10; push({'type': 'fail', 'until': 10}); return self._send(204)
+        ev = EVPATH.match(self.path)
+        if ev:
+            now = time.monotonic(); failing = now < fail_until
+            try: body = json.loads(raw)
+            except ValueError: return self._send(400, '잘못된 형식'.encode())
+            with lock:
+                notes = [] if failing else apply_event(ev.group(1), body)
+                entry = {'t': round(now - t0, 2), 'gap': None, 'meeting': ev.group(1), 'n': 0, 'kind': 'event',
+                         'result': 503 if failing else 204, 'notes': notes, 'body': body}
+                reqlog.append(entry); del reqlog[:-300]
+                st = meetings.get(ev.group(1), {}).get('stats')
+            push({'type': 'req', 'entry': entry, 'changed': [], 'stats': st})
+            return self._send(503 if failing else 204)
         mt = PATH.match(self.path)
         if not mt: return self._send(404)
         now = time.monotonic(); gap = None if last_req[0] is None else now - last_req[0]; last_req[0] = now
