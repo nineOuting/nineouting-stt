@@ -290,6 +290,30 @@ CATCHUP = [False]   # 밀린 소리가 1초 넘게 쌓임 (다시 연결 뒤 몰
 MS = SR * 2 // 1000   # 1ms = 32바이트
 
 
+def health():
+    """상태 확인용 내용과 HTTP 코드. 엔진 스레드가 죽었으면 503을 내서,
+    프로세스는 떠 있는데 전사가 멈춘 상태를 밖에서 알 수 있게 함"""
+    ok = bool(status['running'])
+    body = {'ok': ok, 'input': A.input, 'state': status['state'],
+            'meeting': SESS and SESS['meeting_id'], 'audioSec': status['audio_sec']}
+    if not ok and status.get('error'): body['error'] = status['error']
+    return (200 if ok else 503), json.dumps(body, ensure_ascii=False).encode() + b'\n'
+
+
+def ws_process_request(conn, request):
+    """음성 포트로 오는 평범한 HTTP GET. 상태 확인만 받고, 나머지는 WebSocket 손잡기로 넘김.
+    이 포트는 밖으로 열려 있어서(WS_HOST=0.0.0.0) 컨테이너 밖에서도 닿음. 개발 화면 포트는 닫아 둠"""
+    if request.path.split('?')[0] != '/health': return None
+    from http import HTTPStatus
+    from websockets.datastructures import Headers
+    from websockets.http11 import Response
+    code, body = health()
+    st = HTTPStatus(code)
+    return Response(st.value, st.phrase,
+                    Headers([('Content-Type', 'application/json; charset=utf-8'),
+                             ('Content-Length', str(len(body)))]), body)
+
+
 def ws_close_old(conn):
     """자리를 내준 연결을 닫음. 닫기는 상대 응답을 기다릴 수 있어 새 연결을 막지 않게 따로 스레드에서 부름"""
     try: conn.close(4001, 'replaced by a new connection')
@@ -451,7 +475,8 @@ def _audio_loop():
         read = lambda: w.readframes(1600)
     elif A.input == 'ws':
         from websockets.sync.server import serve
-        wss = serve(ws_handler, A.ws_host, A.ws_port, max_size=2 ** 20, ping_interval=5, ping_timeout=10)
+        wss = serve(ws_handler, A.ws_host, A.ws_port, max_size=2 ** 20, ping_interval=5, ping_timeout=10,
+                    process_request=ws_process_request)   # 같은 포트로 GET /health도 받음
         # ping 5초 간격·10초 대기 → 끊김을 최대 15초 안에 알아차림 (websockets 기본값은 20초·20초)
         threading.Thread(target=wss.serve_forever, daemon=True).start()
         status['source'] = f'WebSocket ws://{A.ws_host}:{A.ws_port}'
@@ -526,6 +551,10 @@ class H(BaseHTTPRequestHandler):
             cfg = json.dumps({'wsPort': A.ws_port, 'backendUrl': A.backend_url.rstrip('/')}).encode()
             body = re.sub(rb'/\*CFG\*/.*?/\*CFG\*/', lambda m: cfg, body, count=1)   # 화면이 실제 포트·자막 주소를 쓰게
             self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+        elif self.path == '/health':   # 음성 포트에도 같은 내용이 있음 (컨테이너 밖에서는 그쪽으로)
+            code, body = health()
+            self.send_response(code); self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
         elif self.path in ('/', '/index.html'):
             body = open(os.path.join(STATIC, 'index.html'), 'rb').read()
