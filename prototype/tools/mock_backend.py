@@ -4,6 +4,12 @@ r"""시험용 가짜 백엔드: STT 서버(backend_sender.py)가 보내는 전�
 받는 곳  POST /internal/meetings/{meetingId}/transcripts   {"segments": [...]}
          POST /internal/meetings/{meetingId}/events        {"event": "start"|"pause"|"resume"|"end", "atMs": 0}
            같은 알림이 두 번 와도 한 번만 센다는 전제로, (event, atMs)가 같으면 중복으로 표시함
+         POST /internal/stt-tickets/{ticket}/consume       음성 연결 입장권 확인 (CN팀 S1, 2026-10-20)
+           성공 200 {"success": true, "data": {"meetingId": 12, "userId": 3}, "message": ""}
+           실패 401 {"success": false, "data": null, "message": "…", "code": "INVALID_STT_TICKET"}
+           30초 유효, 한 번 확인하면 지워짐
+         POST /api/meetings/{meetingId}/stt-ticket         입장권 발급 (시험용. 실제로는 브라우저가 로그인 상태로 부름)
+           200 {"success": true, "data": {"ticket": "…"}, "message": ""}
 합치는 규칙 (2.2 + AI팀 추가 필드, 2026-10-15 확정)
   - 같은 seq는 덮어씀 (이어 붙이지 않음). rev가 지금 것보다 클 때만 반영
   - final: true인 줄은 final: false로 덮지 않음
@@ -15,7 +21,7 @@ r"""시험용 가짜 백엔드: STT 서버(backend_sender.py)가 보내는 전�
   python app/server.py --input ws --backend-url http://127.0.0.1:8767
 화면의 "10초 동안 실패" 버튼: 그동안 503으로 답해 STT의 재전송을 확인함
 """
-import argparse, json, os, queue, re, sys, threading, time
+import argparse, json, os, queue, re, sys, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'app'))
@@ -30,6 +36,10 @@ fail_until = 0.0
 t0 = time.monotonic(); last_req = [None]
 PATH = re.compile(r'^/internal/meetings/([^/]+)/transcripts$')
 EVPATH = re.compile(r'^/internal/meetings/([^/]+)/events$')
+TKPATH = re.compile(r'^/internal/stt-tickets/([^/]+)/consume$')
+ISSUE = re.compile(r'^/api/meetings/([^/]+)/stt-ticket$')
+tickets = {}        # 입장권 → {'meetingId', 'userId', 'expires'}
+TICKET_TTL = 30.0   # 발급 뒤 유효 시간(초)
 
 
 def push(ev):
@@ -76,11 +86,39 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header('Content-Type', ctype); self.send_header('Content-Length', str(len(body)))
         self.end_headers(); self.wfile.write(body)
 
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj, ensure_ascii=False).encode(), 'application/json; charset=utf-8')
+
     def do_POST(self):
         global fail_until
         n = int(self.headers.get('Content-Length') or 0); raw = self.rfile.read(n)
         if self.path == '/fail':
             fail_until = time.monotonic() + 10; push({'type': 'fail', 'until': 10}); return self._send(204)
+        iss = ISSUE.match(self.path)
+        if iss:   # 입장권 발급 (시험용)
+            tk = uuid.uuid4().hex[:16]
+            mid = int(iss.group(1)) if iss.group(1).isdigit() else iss.group(1)
+            with lock:
+                tickets[tk] = {'meetingId': mid, 'userId': 3, 'expires': time.time() + TICKET_TTL}
+            return self._json(200, {'success': True, 'data': {'ticket': tk}, 'message': ''})
+
+        tk = TKPATH.match(self.path)
+        if tk:    # 입장권 확인. 30초 유효, 한 번 쓰면 지워짐
+            with lock:
+                info = tickets.pop(tk.group(1), None)
+            good = info is not None and time.time() < info['expires']
+            why = '' if good else ('연결 입장권이 없거나 만료되었습니다' if info is None else '연결 입장권이 만료되었습니다')
+            entry = {'t': round(time.monotonic() - t0, 2), 'gap': None, 'meeting': info and info['meetingId'],
+                     'n': 0, 'kind': 'ticket', 'result': 200 if good else 401,
+                     'notes': [] if good else [why], 'body': {'ticket': tk.group(1)[:8] + '…'}}
+            with lock:
+                reqlog.append(entry); del reqlog[:-300]
+            push({'type': 'req', 'entry': entry, 'changed': [], 'stats': None})
+            if good:
+                return self._json(200, {'success': True, 'data': {'meetingId': info['meetingId'], 'userId': info['userId']},
+                                        'message': ''})
+            return self._json(401, {'success': False, 'data': None, 'message': why, 'code': 'INVALID_STT_TICKET'})
+
         ev = EVPATH.match(self.path)
         if ev:
             now = time.monotonic(); failing = now < fail_until
