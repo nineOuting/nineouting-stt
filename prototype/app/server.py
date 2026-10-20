@@ -34,7 +34,7 @@ http://localhost:8765 에서 열림. 녹음은 화면의 "녹음 시작"을 눌�
   화면에서 고치거나 지운 것은 보내지 않음 (정식 서비스에서는 백엔드가 처리). 발화자 구분은 하지 않아 화자 번호는 보내지 않음
   --backend-url이 없으면 세션 파일 옆 <이름>.backend.jsonl 에만 기록
 """
-import argparse, datetime, json, os, queue, re, signal, sys, threading, time, wave
+import argparse, datetime, json, os, queue, re, signal, sys, threading, time, urllib.parse, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from envfile import load_env  # noqa: E402
 ENV_LOADED = load_env()   # engine의 모델 폴더 기본값(NINEOUTING_STT_MODELS)도 .env를 따르도록 engine보다 먼저
 from engine import Engine, SR, DEFAULT_MODELS, DEFAULTS, line_kind  # noqa: E402
-from backend_sender import BackendSender  # noqa: E402
+from backend_sender import BackendSender, consume_ticket  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 p = argparse.ArgumentParser()
@@ -75,6 +75,9 @@ p.add_argument('--backend-url', default=os.environ.get('BACKEND_URL', ''),
                help='백엔드 주소 (.env BACKEND_URL, 예: http://meeting-service:8083). 없으면 backend.jsonl 파일에만 기록')
 p.add_argument('--backend-period', type=float, default=0.5, help='백엔드 전송 주기(초). 그사이 바뀐 줄만 보냄')
 p.add_argument('--meeting-id', default='', help='첫 회의의 회의 번호 (백엔드가 쓰는 숫자). 없으면 자동 이름을 붙이고 백엔드로는 보내지 않음')
+p.add_argument('--no-ticket', action='store_true',
+               help='--input ws: 음성 연결 입장권을 확인하지 않음 (백엔드 없이 /sender로 시험할 때). '
+                    '--backend-url이 없으면 어차피 확인하지 않음')
 A = p.parse_args()
 
 if A.list_devices:
@@ -293,16 +296,41 @@ def ws_close_old(conn):
     except Exception: pass
 
 
+WSPATH = re.compile(r'^/ws/stt/meetings/([^/]+)$')
+
+
+def ws_auth(conn):
+    """음성 연결 입장권을 확인함 (CN팀 S1). 이전 연결을 밀어내기 전에 하므로, 틀린 입장권은 열린 회의를 건드리지 못함.
+    → 확인한 정보(dict) / 확인하지 않음(None) / 막음(False, 연결을 닫은 뒤)"""
+    if A.no_ticket or not A.backend_url: return None
+    u = urllib.parse.urlsplit(getattr(getattr(conn, 'request', None), 'path', '') or '')
+    mid = WSPATH.match(u.path)
+    tk = urllib.parse.parse_qs(u.query).get('ticket', [''])[0]
+    if not mid or not tk:
+        print(f'입장권 없는 연결을 거절함 ({u.path or "경로 없음"})', file=sys.stderr, flush=True)
+        conn.close(1008, 'ticket required'); return False
+    data, err = consume_ticket(A.backend_url, tk, 3.0)   # 백엔드가 응답하지 못해도 거절 (CN팀 확인)
+    if data is None:
+        print(f'입장권 확인 실패로 연결을 거절함: {err}', file=sys.stderr, flush=True)
+        conn.close(1008, 'invalid ticket'); return False
+    data['pathMeetingId'] = mid.group(1)
+    return data
+
+
 def ws_handler(conn):
     from websockets.exceptions import ConnectionClosed
     say = lambda **m: conn.send(json.dumps(m, ensure_ascii=False))
+    auth = ws_auth(conn)
+    if auth is False: return
     with lock:
         old, WS['conn'] = WS['conn'], conn
-    if old is not None:
-        print('WebSocket 새 연결이 이전 연결을 대신함', file=sys.stderr, flush=True)
-        threading.Thread(target=ws_close_old, args=(old,), daemon=True).start()
-    print(f'WebSocket 연결: {conn.remote_address}', file=sys.stderr, flush=True)
-    try:
+    try:   # 등록한 뒤부터는 어떤 오류가 나도 아래 finally에서 정리되어야 함
+        if old is not None:
+            print('WebSocket 새 연결이 이전 연결을 대신함', file=sys.stderr, flush=True)
+            threading.Thread(target=ws_close_old, args=(old,), daemon=True).start()
+        try: peer = conn.remote_address   # 상대가 벌써 끊었으면 소켓 주소를 못 읽음
+        except OSError: peer = '?'
+        print(f'WebSocket 연결: {peer}', file=sys.stderr, flush=True)
         for msg in conn:
             if isinstance(msg, bytes):
                 if WS['meeting'] is None: continue          # start 전 소리는 버림
@@ -320,6 +348,12 @@ def ws_handler(conn):
                 if not mid.isdigit():   # 백엔드 회의 번호는 숫자뿐 (CN팀 S5). 틀린 번호로 전사가 나가지 않게 연결을 끊음
                     say(type='error', message='meetingId 없음' if not mid else 'meetingId는 숫자여야 함')
                     conn.close(1008, 'meetingId must be numeric'); return
+                if auth and not (mid == str(auth['meetingId']) == str(auth['pathMeetingId'])):
+                    # 연결 주소·start 메시지·입장권 확인 응답의 meetingId가 모두 같아야 함 (CN팀 S1)
+                    print(f'meetingId가 어긋나 연결을 거절함: 주소 {auth["pathMeetingId"]} · '
+                          f'start {mid} · 입장권 {auth["meetingId"]}', file=sys.stderr, flush=True)
+                    say(type='error', message='meetingId가 연결 주소·입장권과 다름')
+                    conn.close(1008, 'meetingId mismatch'); return
                 if mid == WS['meeting']:                     # 같은 회의로 다시 연결
                     gap = off - WS['ms']
                     if gap > 0:                              # 빈 시간은 무음으로 채워 시각을 맞춤

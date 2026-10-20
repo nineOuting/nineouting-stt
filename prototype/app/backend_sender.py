@@ -45,6 +45,39 @@ def wall():
     return datetime.datetime.now().astimezone().isoformat(timespec='milliseconds')
 
 
+def consume_ticket(url, ticket, timeout=3.0):
+    """음성 연결 입장권을 백엔드에 확인함 (CN팀 S1, 2026-10-20).
+
+      POST {url}/internal/stt-tickets/{ticket}/consume   (요청 본문·인증 헤더 없음, 클러스터 안 주소)
+        200 {"success": true, "data": {"meetingId": 12, "userId": 3}, "message": ""}
+        401 {"success": false, "data": null, "message": "…", "code": "INVALID_STT_TICKET"}
+      입장권은 30초 유효하고 한 번 확인하면 지워짐. 다시 연결할 때는 브라우저가 새로 받아 옴
+
+    → ({'meetingId', 'userId'}, '') 통과 / (None, 사유) 거절이거나 백엔드가 응답하지 못함
+    """
+    u = urllib.parse.urlsplit(url.rstrip('/'))
+    path = f'{u.path}/internal/stt-tickets/{urllib.parse.quote(ticket, safe="")}/consume'
+    cls = http.client.HTTPSConnection if u.scheme == 'https' else http.client.HTTPConnection
+    c = cls(u.netloc, timeout=timeout)
+    try:
+        c.request('POST', path, body=b'', headers={'Content-Length': '0'})
+        r = c.getresponse(); raw = r.read()
+        if r.status == 200:
+            body = json.loads(raw)
+            d = body.get('data') or {}
+            if body.get('success') and d.get('meetingId') is not None:
+                return {'meetingId': d['meetingId'], 'userId': d.get('userId')}, ''
+            return None, '200인데 meetingId가 없음'
+        msg = ''
+        try: msg = (json.loads(raw) or {}).get('message') or ''
+        except ValueError: pass
+        return None, f'HTTP {r.status}' + (f' {msg}' if msg else '')
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        return None, str(e) or type(e).__name__
+    finally:
+        c.close()
+
+
 class BackendSender:
     RETRY = 2.0   # 알림을 보내지 못했을 때 다시 시도하기까지 (초)
 
