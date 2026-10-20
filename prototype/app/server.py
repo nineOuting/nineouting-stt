@@ -287,7 +287,12 @@ def control(eng, act):
 #   텍스트(JSON): {"type":"start","meetingId":"…","offsetMs":0} / {"type":"pause"} / {"type":"resume"} / {"type":"end"}
 #     start의 offsetMs = 이어서 보낼 소리가 회의 시작 기준 몇 ms부터인지. 같은 회의로 다시 연결하면 겹친 만큼 버리고 빈 만큼 무음으로 채움
 #   서버 → 브라우저: {"type":"ready","meetingId","meetingMs"} (meetingMs = 서버가 받은 그 회의 소리 길이), {"type":"ended"}, {"type":"error","message"}
-# 회의(연결)는 한 번에 하나. 두 번째 연결은 거절함. 작성자 확인은 백엔드 몫이라 하지 않음
+# 연결은 한 번에 하나. 새 연결이 오면 이전 연결을 닫고 이어받음 (CN팀 S6, 2026-10-20)
+#   끊긴 것을 서버가 아직 모르는 사이에 브라우저가 다시 붙어도 막히지 않게 함. 자리를 내준 연결은 4001로 닫아
+#   브라우저가 "내가 밀려남"과 "그냥 끊김"을 구분할 수 있게 함
+#   연결 시점에는 어느 회의인지 알 수 없어(meetingId는 뒤이어 오는 start에 들어 있음) 회의를 가리지 않고 이어받음.
+#   이어받은 연결이 다른 meetingId로 start하면 이전 회의를 닫고 새 회의를 엶 (control의 start 분기)
+#   작성자 확인은 백엔드 몫이라 하지 않음 (입장권 확인이 들어오면 연결 주소의 meetingId로 회의를 가릴 수 있음)
 # 소리와 제어 메시지를 한 대기열에 순서대로 넣어, 소리 처리 루프가 받은 순서대로 처리함
 WSQ = queue.Queue()
 WS = {'conn': None, 'meeting': None, 'ms': 0.0, 'skip': 0}   # 지금 연결, 회의, 그 회의에서 받은 소리(ms), 겹쳐서 버릴 바이트
@@ -295,13 +300,20 @@ CATCHUP = [False]   # 밀린 소리가 1초 넘게 쌓임 (다시 연결 뒤 몰
 MS = SR * 2 // 1000   # 1ms = 32바이트
 
 
+def ws_close_old(conn):
+    """자리를 내준 연결을 닫음. 닫기는 상대 응답을 기다릴 수 있어 새 연결을 막지 않게 따로 스레드에서 부름"""
+    try: conn.close(4001, 'replaced by a new connection')
+    except Exception: pass
+
+
 def ws_handler(conn):
     from websockets.exceptions import ConnectionClosed
     say = lambda **m: conn.send(json.dumps(m, ensure_ascii=False))
     with lock:
-        if WS['conn'] is not None:
-            conn.close(1008, 'another connection is active'); return
-        WS['conn'] = conn
+        old, WS['conn'] = WS['conn'], conn
+    if old is not None:
+        print('WebSocket 새 연결이 이전 연결을 대신함', file=sys.stderr, flush=True)
+        threading.Thread(target=ws_close_old, args=(old,), daemon=True).start()
     print(f'WebSocket 연결: {conn.remote_address}', file=sys.stderr, flush=True)
     try:
         for msg in conn:
@@ -341,8 +353,11 @@ def ws_handler(conn):
     except ConnectionClosed:
         pass
     finally:
-        with lock: WS['conn'] = None
-        print('WebSocket 연결 끊김' + (f' (회의 {WS["meeting"]}는 열린 채 다시 연결을 기다림)' if WS['meeting'] else ''), file=sys.stderr, flush=True)
+        with lock:
+            mine = WS['conn'] is conn   # 이미 다른 연결이 들어왔으면 그쪽을 지우지 않음
+            if mine: WS['conn'] = None
+        if mine:
+            print('WebSocket 연결 끊김' + (f' (회의 {WS["meeting"]}는 열린 채 다시 연결을 기다림)' if WS['meeting'] else ''), file=sys.stderr, flush=True)
 
 
 def ws_read():
@@ -414,7 +429,8 @@ def _audio_loop():
         read = lambda: w.readframes(1600)
     elif A.input == 'ws':
         from websockets.sync.server import serve
-        wss = serve(ws_handler, A.ws_host, A.ws_port, max_size=2 ** 20)   # ping은 websockets 기본값(20초)으로 보냄
+        wss = serve(ws_handler, A.ws_host, A.ws_port, max_size=2 ** 20, ping_interval=5, ping_timeout=10)
+        # ping 5초 간격·10초 대기 → 끊김을 최대 15초 안에 알아차림 (websockets 기본값은 20초·20초)
         threading.Thread(target=wss.serve_forever, daemon=True).start()
         status['source'] = f'WebSocket ws://{A.ws_host}:{A.ws_port}'
         print(f'WebSocket 입력 대기: ws://{A.ws_host}:{A.ws_port}  시험용 보내는 화면: http://localhost:{A.port}/sender', file=sys.stderr, flush=True)
