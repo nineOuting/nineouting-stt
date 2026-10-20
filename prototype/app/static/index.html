@@ -119,8 +119,6 @@
   aside li .alts { display: block; font-size: 13px; margin-top: 2px; }
   .empty { color: var(--muted); text-align: center; padding: 48px 0; }
   /* 줄마다 요약 전송 표시 (시각 아래) */
-  .t .sb { display: block; font-size: 10.5px; line-height: 1.3; margin-top: 2px; color: var(--muted); white-space: nowrap; cursor: help; }
-  .t .sb.wait { color: var(--rec-tag); }
   /* 요약 전송 상태창 */
   .sendsum { padding: 10px 16px 4px; font-size: 13px; color: var(--muted); display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
   .sendsum b { color: var(--fg); font-weight: 600; overflow-wrap: anywhere; }
@@ -148,7 +146,6 @@
   .pkt .it .v .mini.lc { color: var(--rec-tag); border-color: currentColor; }
   .pkt .it.del .v { color: var(--muted); text-decoration: line-through; }
   .pkt > .why { font-size: 12px; color: #dc2626; margin-bottom: 2px; }
-  .t .sb.fail { color: #dc2626; }
   .pkt details { margin-top: 4px; }
   .pkt summary { font-size: 11.5px; color: var(--muted); cursor: pointer; }
   .pkt pre { margin: 4px 0 0; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere;
@@ -212,7 +209,7 @@
     <button class="btn ghost" id="doneBtn" hidden title="이 세션의 전사 파일(과 녹음)을 닫고 대기합니다">완료</button>
   </div>
   <button class="btn ghost" id="clearBtn" title="지금까지의 전사문을 모두 지웁니다 (되돌릴 수 없음)">지우기</button>
-  <button class="btn ghost" id="sendBtn" aria-expanded="false" aria-controls="sendPanel" title="요약 쪽으로 무엇이 언제 어떻게 보내졌는지 봅니다">요약 전송</button>
+  <button class="btn ghost" id="sendBtn" aria-expanded="false" aria-controls="sendPanel" title="백엔드로 무엇이 언제 어떻게 보내졌는지 봅니다">백엔드 전송</button>
   <button class="btn" id="recBtn" aria-expanded="false" aria-controls="recPanel" disabled>보완 0건</button>
 </header>
 <main id="list"><div class="empty" id="empty">말을 시작하면 여기에 전사문이 나타납니다.</div></main>
@@ -224,12 +221,12 @@
   <div class="sub">STT가 놓친 말소리를 VAD로 찾아 다시 인식한 줄. 누르면 본문 위치로 이동합니다.</div>
   <ol id="recList"><li class="none" id="recNone">아직 없습니다.</li></ol>
 </aside>
-<aside id="sendPanel" aria-label="요약 전송 상태">
-  <div class="hd"><h2>요약 전송</h2><span class="meta" id="sendCount"></span>
+<aside id="sendPanel" aria-label="백엔드 전송 상태">
+  <div class="hd"><h2>백엔드 전송</h2><span class="meta" id="sendCount"></span>
     <button class="close" id="sendClose" aria-label="닫기">×</button></div>
   <div class="sendsum" id="sendSum"></div>
   <div class="sendbody">
-    <h3>다음 묶음 <span class="cd" id="sendNext"></span></h3>
+    <h3>못 보낸 것 <span class="cd">(복구되면 다시 보냄)</span></h3>
     <ul id="sendPending"><li class="none">없음</li></ul>
     <h3>보낸 기록 <span class="cd">(최근 것부터)</span></h3>
     <ol id="sendLog"><li class="none">아직 없습니다.</li></ol>
@@ -367,7 +364,6 @@ function renderLine(el) {
   x.append(el$('span', 'txt'));
   renderConf(el, d.text, d.conf);
   if (d.edited) { const b = el$('span', 'edited', d.edited === 'alt' ? '후보로 바꿈' : '직접 고침'); b.title = `원래: ${d.orig}`; x.append(b); }
-  sendBadge(el);
   const eb = el$('button', 'editbtn', '✎'); eb.title = '직접 고치기'; eb.setAttribute('aria-label', '이 줄 직접 고치기');
   eb.onclick = () => startEdit(el); x.append(eb);
   const ab = el$('button', 'editbtn', '＋'); ab.title = '이 줄 다음에 놓친 말 추가'; ab.setAttribute('aria-label', '이 줄 다음에 줄 추가');
@@ -504,8 +500,6 @@ function handle(ev) {
     el.classList.remove('partial'); el.dataset.start = ev.start;
     el.querySelector('.t').textContent = fmt(ev.start);
     el._d = { ...ev };
-    if (ev.sent_seq) sentSeq.set(ev.id, ev.sent_seq);
-    if (ev.edit_sent_seq) editSeq.set(ev.id, ev.edit_sent_seq);
     renderLine(el); place(el);
     if (ev.type === 'recovered') { addRec(el._d); flash(el); }
   } else if (ev.type === 'delete') {   // 지운 줄: 본문과 보완 목록에서 뺌
@@ -566,89 +560,59 @@ recBtn.onclick = () => togglePanel();
 sendBtn.onclick = () => setPanel(panel === 'send' ? null : 'send');
 document.getElementById('sendClose').onclick = () => setPanel(null);
 
-// ---- 요약 전송 상태 ----
-// 서버가 보낸 것: send_init(접속 때 기록 전체), send_pending(대기 목록이 바뀜), send(묶음·알림을 보냄)
-const sentSeq = new Map(), editSeq = new Map(), failSeq = new Set();   // failSeq: 보내지 못한 묶음 번호   // 줄 id → 그 줄이 / 그 줄의 수정이 들어간 묶음 번호
-let snap = null, pendLines = new Set(), pendEdits = new Set();
+// ---- 백엔드 전송 상태 ----
+// 서버가 보낸 것: send_init(접속 때 기록 전체), send(전사 줄 묶음이나 회의 알림 하나를 보냄)
+let snap = null;
 const EVT = { start: '회의 시작', pause: '멈춤', resume: '재개', end: '회의 끝' };
 const RES = { ok: ['ok', '보냄'], file: ['file', '파일에만 기록'], fail: ['fail', '실패'] };
 const fmtMs = ms => fmt(ms / 1000);
 const clock = w => (w || '').slice(11, 19);
-function sendBadge(el) {
-  const d = el._d; if (!d) return;
-  el.querySelector('.t .sb')?.remove();
-  let txt = '', cls = 'sb', tip = '';
-  if (pendLines.has(d.id)) { txt = '대기'; cls += ' wait'; tip = '다음 묶음으로 요약 쪽에 보낼 줄'; }
-  else if (pendEdits.has(d.id)) { txt = '수정 대기'; cls += ' wait'; tip = '이미 보낸 줄. 고친 내용(또는 삭제)을 다음 묶음으로 보냄'; }
-  else if (sentSeq.has(d.id)) { const q = sentSeq.get(d.id), eq = editSeq.get(d.id);
-    txt = `#${q}` + (failSeq.has(q) ? ' 실패' : ''); tip = `${q}번 묶음으로 보냄` + (failSeq.has(q) ? ' (요약 쪽에 전달되지 않음)' : '');
-    if (eq) { txt += ` · 수정 #${eq}` + (failSeq.has(eq) ? ' 실패' : ''); tip += `, 고친 내용은 ${eq}번 묶음으로 보냄` + (failSeq.has(eq) ? ' (전달되지 않음)' : ''); }
-    if (failSeq.has(q) || (eq && failSeq.has(eq))) cls += ' fail'; }
-  if (!txt) return;
-  const b = el$('span', cls, txt); b.title = tip; el.querySelector('.t').append(b);
-}
 function itemRow(k, v, cls) { const r = el$('li', 'it' + (cls ? ' ' + cls : '')); r.append(el$('span', 'k', k)); r.append(v); return r; }
-function lineItem(x) {
+function segItem(x) {
   const v = el$('span', 'v');
-  if (x.type === 'recovered') v.append(el$('span', 'mini', '보완'));
-  if (x.type === 'manual') v.append(el$('span', 'mini', '직접 추가'));
+  if (!x.final) v.append(el$('span', 'mini', '말하는 중'));
+  if (x.recovered) v.append(el$('span', 'mini', '보완'));
   if (x.kind) v.append(el$('span', 'mini', KIND[x.kind]));
-  if (x.low_confidence) { const m = el$('span', 'mini lc', '신뢰도 낮음'); m.title = '줄 글자 중 확률 0.3 미만이 20% 이상'; v.append(m); }
+  if (x.lowConfidence) { const m = el$('span', 'mini lc', '신뢰도 낮음'); m.title = '줄 글자 중 확률 0.3 미만이 20% 이상'; v.append(m); }
   v.append(x.text);
-  return itemRow(`줄 ${x.id} · ${fmtMs(x.start_ms)}`, v);
-}
-function editItem(x) {
-  if (x.deleted) return itemRow(`삭제 · 줄 ${x.id}`, el$('span', 'v', rows.get(x.id)?._d?.text ?? '(지운 줄)'), 'del');
-  return itemRow(`수정 · 줄 ${x.id}`, el$('span', 'v', `${x.rev}번째 고침 → ${x.text}`));
+  return itemRow(`줄 ${x.seq} · rev ${x.rev} · ${fmtMs(x.startMs)}`, v);
 }
 function packet(e) {
-  const m = e.msg, li = el$('li', 'pkt'), h = el$('div', 'ph');
-  h.append(el$('b', null, m.event ? EVT[m.event] || m.event : `#${m.seq} 묶음`), el$('time', null, clock(e.wall)));
+  const li = el$('li', 'pkt'), h = el$('div', 'ph');
+  h.append(el$('b', null, e.event ? (EVT[e.event.event] || e.event.event) : `전사 ${(e.segments || []).length}줄`),
+           el$('time', null, clock(e.wall)));
   const [rc, rt] = RES[e.result] || ['file', e.result]; const r = el$('span', 'res ' + rc, rt);
   if (e.error) r.title = e.error;
   h.append(r);
-  if (m.event) h.append(el$('span', 'k', `음성 ${fmtMs(m.at_ms)}`));
+  if (e.event) h.append(el$('span', 'k', `음성 ${fmtMs(e.event.atMs)}`));
   li.append(h);
   if (e.error) li.append(el$('div', 'why', `이유: ${e.error}`));
-  const ul = el$('ul');
-  for (const x of m.lines || []) ul.append(lineItem(x));
-  for (const x of m.edits || []) ul.append(editItem(x));
-  if (ul.children.length) li.append(ul);
-  const det = el$('details'); det.append(el$('summary', null, '보낸 JSON'), el$('pre', null, JSON.stringify(m, null, 2)));
+  if (e.segments) { const ul = el$('ul'); for (const x of e.segments) ul.append(segItem(x)); li.append(ul); }
+  const det = el$('details');
+  det.append(el$('summary', null, '보낸 JSON'), el$('pre', null, JSON.stringify(e.event || { segments: e.segments }, null, 2)));
   li.append(det);
   return li;
 }
 function renderSnap() {
   if (!snap) return;
-  pendLines = new Set(snap.pending_lines.map(x => x.id)); pendEdits = new Set(snap.pending_edits.map(x => x.id));
   const st = snap.stats, sum = document.getElementById('sendSum'); sum.textContent = '';
   const row = (k, v, bad) => { sum.append(el$('span', null, k)); const b = el$('b', bad ? 'bad' : null, v); sum.append(b); return b; };
-  row('받는 곳', snap.url || '없음 · 파일(outbox)에만 기록').title = snap.outbox || '';
-  row('회의', snap.meeting_id || '-');
-  row('주기', `${snap.period}초마다, 보낼 것이 있을 때만`);
-  row('보낸 묶음', `${snap.seq || 0}개`);
-  if (snap.url) row('결과', `성공 ${st.sent} · 실패 ${st.failed}`, st.failed > 0);
+  row('받는 곳', snap.url || '없음 · 파일에만 기록').title = snap.logfile || '';
+  row('회의 번호', snap.meeting_id || '-');
+  row('줄 전송', `${snap.period}초마다, 바뀐 줄만`);
+  row('보낸 알림', `${st.events}개`);
+  if (snap.url) row('결과', `요청 ${st.requests} · 성공 ${st.sent} · 실패 ${st.failed}`, st.failed > 0);
   const pend = document.getElementById('sendPending'); pend.textContent = '';
-  const n = snap.pending_lines.length + snap.pending_edits.length;
+  const n = snap.pending_lines + snap.pending_events.length;
   if (!n) pend.append(el$('li', 'none', '없음'));
   else { const li = el$('li', 'pkt pending'), ul = el$('ul');
-         for (const x of snap.pending_lines) ul.append(lineItem(x));
-         for (const x of snap.pending_edits) ul.append(editItem(x));
+         if (snap.pending_lines) ul.append(itemRow('전사 줄', el$('span', 'v', `${snap.pending_lines}줄`)));
+         for (const x of snap.pending_events) ul.append(itemRow('알림', el$('span', 'v', `${EVT[x.event] || x.event} · 음성 ${fmtMs(x.atMs)}`)));
          li.append(ul); pend.append(li); }
-  sendBtn.textContent = `요약 전송 #${snap.seq || 0}` + (st.failed ? ` · 실패 ${st.failed}` : '');
-  document.getElementById('sendCount').textContent = n ? `대기 ${n}` : '';
-  for (const r of rows.values()) if (r._d) sendBadge(r);
-  tickCd();
+  sendBtn.textContent = '백엔드 전송' + (st.failed ? ` · 실패 ${st.failed}` : '');
+  document.getElementById('sendCount').textContent = n ? `못 보냄 ${n}` : '';
 }
-function tickCd() {
-  if (!snap) return;
-  const left = Math.max(0, Math.ceil(snap.tick + snap.period - Date.now() / 1000));
-  const n = snap.pending_lines.length + snap.pending_edits.length;
-  document.getElementById('sendNext').textContent = n ? `${left}초 뒤 보냄` : `다음 주기 ${left}초 뒤`;
-}
-setInterval(tickCd, 1000);
 function addPacket(e) {
-  if (e.result === 'fail' && e.msg.seq) failSeq.add(e.msg.seq);
   const log = document.getElementById('sendLog'); log.querySelector('.none')?.remove();
   log.prepend(packet(e));
   while (log.children.length > 300) log.lastChild.remove();
@@ -657,12 +621,7 @@ function handleSend(ev) {
   if (ev.type === 'send_init') {
     document.getElementById('sendLog').innerHTML = '<li class="none">아직 없습니다.</li>';
     for (const e of ev.history) addPacket(e);
-  } else if (ev.type === 'send') {
-    const m = ev.entry.msg;
-    for (const x of m.lines || []) sentSeq.set(x.id, m.seq);
-    for (const x of m.edits || []) editSeq.set(x.id, m.seq);
-    addPacket(ev.entry);
-  }
+  } else if (ev.type === 'send') addPacket(ev.entry);
   snap = ev.snap; renderSnap();
 }
 

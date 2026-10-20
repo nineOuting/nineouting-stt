@@ -126,9 +126,13 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
   - 응답(JSON): `ready`(서버가 받은 그 회의 소리 길이 `meetingMs`), `ended`, `error`
   - 시각은 모두 회의 시작 기준 음성 밀리초. 실제 시각(벽시계)은 브라우저가 보내지 않음 (백엔드가 기록)
   - 끊겼다 다시 붙을 때는 `start`의 `offsetMs`에 이어 보낼 위치를 넣음. 겹친 부분은 버리고 빈 시간은 무음으로 채움
+  - `meetingId`는 백엔드 회의 번호(숫자). 숫자가 아니면 연결을 끊음 (틀린 번호로 전사가 나가지 않게)
   - 연결은 한 번에 하나. 새 연결이 오면 이전 연결을 닫고 이어받음 (서버가 끊김을 아직 모르는 사이에 다시 붙어도 막히지 않게). 자리를 내준 연결은 코드 `4001`로 닫히므로, 브라우저는 이 코드를 받으면 다시 붙지 않아야 함
+- 백엔드로 보내는 것 (`app/backend_sender.py`)
+  - 전사 줄: `POST /internal/meetings/{meetingId}/transcripts`, 0.5초마다 바뀐 줄만
+  - 회의 알림: `POST /internal/meetings/{meetingId}/events`, 시작·멈춤·재개·끝을 생긴 순서대로 하나씩. 앞의 알림이 성공해야 다음을 보내고, 못 보낸 것은 복구 뒤 순서대로 나감
+  - AI 서비스로는 백엔드가 넘김. STT에서 직접 보내던 경로는 없앰 (2026-10-20)
 - 파일: 세션마다 `transcripts/날짜_시각.jsonl`(전사), `.backend.jsonl`(백엔드로 보낸 것), 녹음 버튼을 누르면 `.wav`. 깃에 올라가지 않음
-- 요약 쪽 직접 전송(`app/summary_sender.py`, 10초 주기)은 이전 설계용으로 남아 있음
 
 ## 용어
 
