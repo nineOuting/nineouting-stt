@@ -139,6 +139,23 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
   - AI 서비스로는 백엔드가 넘김. STT에서 직접 보내던 경로는 없앰 (2026-10-20)
 - 파일: 세션마다 `transcripts/날짜_시각.jsonl`(전사), `.backend.jsonl`(백엔드로 보낸 것), 녹음 버튼을 누르면 `.wav`. 깃에 올라가지 않음
 
+## 이미지
+
+`develop`에 들어갈 때마다 GitHub Actions가 만들어 GHCR에 올립니다.
+
+```bash
+docker pull ghcr.io/nineouting/nineouting-stt:develop
+docker run -p 8770:8770 -e BACKEND_URL=http://meeting-service:8083 ghcr.io/nineouting/nineouting-stt:develop
+```
+
+- **플랫폼: `linux/amd64`와 `linux/arm64`.** 하나의 태그에 둘 다 들어 있어 받는 쪽 CPU에 맞는 것이 자동으로 내려옵니다. 일부러 고르려면 `docker pull --platform linux/amd64 …`
+- 태그: 브랜치 이름(`:develop`)과 커밋 SHA. 다른 서비스 레포와 같은 모양입니다
+- 모델은 이미지 안에 들어 있어(약 160MB) 실행할 때 받지 않습니다
+- 기본값으로 음성 포트만 열립니다 (`WS_HOST=0.0.0.0`, `STT_HOST=127.0.0.1`). 개발 화면은 로그인이 없으므로 운영에서 열지 마세요
+- 상태 확인: `GET :8770/health`
+
+직접 만들려면 `docker build -t nineouting-stt prototype/` 입니다. 빌드 컨텍스트가 `prototype/`입니다.
+
 ## 용어
 
 | 용어 | 뜻 |
