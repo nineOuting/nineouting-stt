@@ -155,6 +155,7 @@ docker run -p 8770:8770 -e BACKEND_URL=http://meeting-service:8083 ghcr.io/nineo
 - 모델은 이미지 안에 들어 있어(약 160MB) 실행할 때 받지 않습니다
 - 기본값으로 음성 포트만 열립니다 (`WS_HOST=0.0.0.0`, `STT_HOST=127.0.0.1`). 개발 화면은 로그인이 없으므로 운영에서 열지 마세요
 - 상태 확인: `GET :8770/health`
+- 실행 사용자: **uid 10001** (root 아님, ai-service와 같음). 실행 중에 쓰는 곳은 전사 폴더 `/app/transcripts`뿐이고, 이미지 안에서 그 폴더만 10001 소유로 바꿔 둡니다. 볼륨 없이, 새 docker 볼륨, 쿠버네티스 `emptyDir`는 그대로 씁니다. 리눅스 호스트 폴더나 root 시절에 만든 볼륨을 붙이면 10001이 쓸 수 있게 소유자·권한을 맞춰야 합니다
 - 끄기: `docker stop`·쿠버네티스가 보내는 SIGTERM을 받으면 말하던 줄을 확정하고 남은 줄을 보낸 뒤 바로 끝납니다. **회의 `end` 알림은 보내지 않습니다** (파드를 내리는 것이지 회의가 끝난 것이 아니고, 새 STT에 브라우저가 `offsetMs`로 이어 붙음). 터미널에서 Ctrl+C로 끄면 지금처럼 `end`까지 보냅니다
 
 직접 만들려면 `docker build -t nineouting-stt prototype/` 입니다. 빌드 컨텍스트가 `prototype/`입니다.

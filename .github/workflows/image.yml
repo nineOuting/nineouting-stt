@@ -105,7 +105,8 @@ jobs:
                          hotwords='/app/app/hotwords.txt')
           rec.create_stream()
           assert os.path.exists(DEFAULT_MODELS + '/speaker/silero_vad.onnx'), 'VAD 모델 없음'
-          print('모델 확인 uid=%d arch=%s' % (os.getuid(), platform.machine()))
+          open('/app/transcripts/.write-check', 'w').close()   # 실행 사용자가 전사 폴더에 쓸 수 있는지
+          print('모델 확인 uid=%d arch=%s 전사 폴더 쓰기 됨' % (os.getuid(), platform.machine()))
           " | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: digest 넘기기
