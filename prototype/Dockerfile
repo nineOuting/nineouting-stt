@@ -24,6 +24,12 @@ RUN python tools/download_models.py
 COPY app/ app/
 COPY tools/ tools/
 
+# root가 아닌 사용자로 실행 (ai-service와 같은 uid·방식). 실행 중에 쓰는 곳은 전사 폴더뿐이라
+# 그 폴더만 소유자를 바꾸고, 모델·코드는 root 소유 그대로 읽기만 함
+RUN useradd --uid 10001 --create-home app \
+ && mkdir -p /app/transcripts && chown 10001 /app/transcripts
+USER 10001
+
 # 음성 포트만 밖으로 열고, 개발 화면은 컨테이너 안에서만 (로그인이 없는 화면이라 노출하지 않음).
 # 두 값 모두 실행할 때 환경변수로 덮을 수 있음
 ENV WS_HOST=0.0.0.0 \
@@ -36,5 +42,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
     CMD python -c "import urllib.request as u, sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8770/health', timeout=4).status == 200 else 1)"
 
 # 전사 파일은 /app/transcripts에 쌓임. 백엔드로도 보내므로 남기지 않아도 되지만,
-# 보관하려면 그 경로를 볼륨으로 붙이면 됨
+# 보관하려면 그 경로를 볼륨으로 붙이면 됨 (uid 10001이 쓸 수 있어야 함)
 CMD ["python", "app/server.py", "--input", "ws", "--no-alt", "--no-diar"]
