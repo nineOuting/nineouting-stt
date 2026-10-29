@@ -15,6 +15,7 @@ r"""시험용 가짜 백엔드: STT 서버(backend_sender.py)가 보내는 전�
   - final: true인 줄은 final: false로 덮지 않음
   - 화면·저장 순서는 startMs 기준 (seq는 시간 순서가 아님, 보완 줄이 앞 시각으로 늦게 옴)
 규칙 위반으로 세는 것: 옛 rev(지금 것 이하)가 온 경우, 확정 뒤 같은 seq가 다시 온 경우
+한 요청 최대 500줄: meeting-service처럼 넘으면 요청 전체를 400으로 거절하고 하나도 반영하지 않음 (--max-segments, 0이면 검사 안 함)
 
 실행 (nineouting-stt/prototype 기준, 윈도우는 python 대신 .venv\Scripts\python, 맥은 .venv/bin/python)
   python tools/mock_backend.py              → http://localhost:8767 (확인 화면, 포트는 --port 또는 .env MOCK_PORT)
@@ -27,7 +28,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'app'))
 from envfile import load_env  # noqa: E402
 load_env()
-p = argparse.ArgumentParser(); p.add_argument('--port', type=int, default=os.environ.get('MOCK_PORT', 8767)); A = p.parse_args()
+p = argparse.ArgumentParser(); p.add_argument('--port', type=int, default=os.environ.get('MOCK_PORT', 8767))
+p.add_argument('--max-segments', type=int, default=500, help='한 요청 최대 줄 수 (meeting-service와 같음). 0이면 검사 안 함')
+A = p.parse_args()
 lock = threading.Lock()
 meetings = {}       # meetingId → {'seg': {seq: segment}, 'stats': {...}}
 reqlog = []         # 최근 요청
@@ -49,7 +52,7 @@ def push(ev):
 def mget(mid):
     return meetings.setdefault(mid, {'seg': {}, 'events': [], 'seen_events': set(),
                                      'stats': {'requests': 0, 'segments': 0, 'stale_rev': 0, 'after_final': 0,
-                                               'events': 0, 'dup_events': 0}})
+                                               'too_many': 0, 'events': 0, 'dup_events': 0}})
 
 
 def apply_event(mid, ev):
@@ -139,14 +142,20 @@ class H(BaseHTTPRequestHandler):
         try: body = json.loads(raw); segs = body['segments']
         except (ValueError, KeyError, TypeError):
             return self._send(400, '잘못된 형식'.encode())
+        too_many = not failing and A.max_segments and len(segs) > A.max_segments
+        code = 503 if failing else 400 if too_many else 204
         with lock:
-            changed, notes = ([], []) if failing else apply(mt.group(1), segs)
+            if too_many:   # meeting-service처럼 요청 전체를 거절 (한 줄도 반영하지 않음)
+                st = mget(mt.group(1))['stats']; st['requests'] += 1; st['too_many'] += 1
+                changed, notes = [], [f'{len(segs)}줄, 한 요청 최대 {A.max_segments}줄을 넘어 400']
+            else:
+                changed, notes = ([], []) if failing else apply(mt.group(1), segs)
             entry = {'t': round(now - t0, 2), 'gap': gap and round(gap, 2), 'meeting': mt.group(1), 'n': len(segs),
-                     'result': 503 if failing else 204, 'notes': notes, 'body': body}
+                     'result': code, 'notes': notes, 'body': body}
             reqlog.append(entry); del reqlog[:-300]
             st = meetings.get(mt.group(1), {}).get('stats')
         push({'type': 'req', 'entry': entry, 'changed': changed, 'stats': st})
-        self._send(503 if failing else 204)
+        self._send(code)
 
     def do_GET(self):
         if self.path in ('/', '/index.html'):
@@ -200,7 +209,7 @@ const M={};let cur=null;const fmt=ms=>{const s=ms/1000;return String(Math.floor(
 function stats(){const m=M[cur];if(!m)return;const s=m.stats||{},seg=Object.values(m.seg);
  document.getElementById('stats').innerHTML=`<span>요청 ${s.requests||0}</span><span>받은 segment ${s.segments||0}</span>`+
  `<span>확정 줄 ${seg.filter(x=>x.final).length}</span><span>보완 줄 ${seg.filter(x=>x.recovered).length}</span>`+
- `<span>말하는 중 ${seg.filter(x=>!x.final).length}</span><span style="color:${(s.stale_rev||s.after_final)?'#c00':'#393'}">규칙 위반: 옛 rev ${s.stale_rev||0} · 확정 뒤 다시 옴 ${s.after_final||0}</span>`}
+ `<span>말하는 중 ${seg.filter(x=>!x.final).length}</span><span style="color:${(s.stale_rev||s.after_final||s.too_many)?'#c00':'#393'}">규칙 위반: 옛 rev ${s.stale_rev||0} · 확정 뒤 다시 옴 ${s.after_final||0} · 한 요청 줄 수 넘음 ${s.too_many||0}</span>`}
 function render(flash){const m=M[cur];const el=document.getElementById('lines');if(!m){el.innerHTML='';return}
  const atBottom=el.parentNode.scrollTop+el.parentNode.clientHeight>=el.parentNode.scrollHeight-40;
  el.innerHTML=Object.values(m.seg).sort((a,b)=>a.startMs-b.startMs).map(s=>

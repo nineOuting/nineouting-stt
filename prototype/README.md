@@ -97,7 +97,7 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 |---|---|---|---|
 | STT 서버 (`app/server.py`) | `localhost:8765/sender` | 보내기 + 자막 + 지연 | 작성자 브라우저 흉내. 마이크 소리를 STT로 보내고(시작·멈춤·재개·종료, 끊고 다시 붙기), 가짜 백엔드가 받은 자막과 지연(말한 때 → 글자가 뜬 때)을 보여줌 |
 | STT 서버 (`app/server.py`) | `localhost:8765` | STT 개발 화면 | STT가 인식한 결과를 바로 봄. 직접 고치기, 다른 인식 결과, 확신도 낮은 글자 표시. 시각은 STT 내부 기준이라 멈출 때마다 2.5초씩 앞섬 |
-| 가짜 백엔드 (`tools/mock_backend.py`) | `localhost:8767` | 가짜 백엔드 | 받은 요청 기록과 원문 JSON, 합친 자막, 규칙 위반 수. "10초 동안 실패(503)" 버튼으로 장애 뒤 재전송 시험 |
+| 가짜 백엔드 (`tools/mock_backend.py`) | `localhost:8767` | 가짜 백엔드 | 받은 요청 기록과 원문 JSON, 합친 자막, 규칙 위반 수. "10초 동안 실패(503)" 버튼으로 장애 뒤 재전송 시험. 백엔드처럼 한 요청이 500줄을 넘으면 400 (`--max-segments`) |
 
 ## 자주 쓰는 옵션
 
@@ -136,6 +136,7 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 - 백엔드로 보내는 것 (`app/backend_sender.py`)
   - 전사 줄: `POST /internal/meetings/{meetingId}/transcripts`, 0.5초마다 바뀐 줄만
   - `seq`는 `start`의 `offsetMs // 10`부터 셈. STT가 회의 도중 다시 켜져도 같은 회의 안에서 앞서 보낸 줄 번호와 겹치지 않게 함 (백엔드는 확정한 줄과 같은 `seq`가 다시 오면 버림)
+  - 한 요청에 최대 500줄 (백엔드가 넘는 요청을 통째로 400으로 거절). 장애로 밀린 줄이 많으면 500줄씩 나눠 보내고, 한 묶음이 실패하면 그 주기는 멈춘 뒤 다음 주기에 그 묶음부터 다시 보냄
   - 회의 알림: `POST /internal/meetings/{meetingId}/events`, 시작·멈춤·재개·끝을 생긴 순서대로 하나씩. 앞의 알림이 성공해야 다음을 보내고, 못 보낸 것은 복구 뒤 순서대로 나감
   - AI 서비스로는 백엔드가 넘김. STT에서 직접 보내던 경로는 없앰 (2026-10-20)
 - 파일: 세션마다 `transcripts/날짜_시각.jsonl`(전사), `.backend.jsonl`(백엔드로 보낸 것), 녹음 버튼을 누르면 `.wav`. 깃에 올라가지 않음
