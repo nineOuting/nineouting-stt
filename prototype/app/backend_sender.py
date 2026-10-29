@@ -17,6 +17,10 @@
   - 확정한 줄은 다시 보내지 않음 (확정 뒤 수정·삭제는 백엔드가 처리)
   - 보완 줄은 말하는 중 단계 없이 final·recovered로 바로 오고, 앞 시각에 끼워질 수 있음 (seq는 시간 순서가 아님)
   - 보내지 못하면 그 줄들을 다음 주기에 다시 보냄. rev로 덮어쓰므로 두 번 받아도 결과가 같음
+  - 한 요청에 최대 500줄 (meeting-service @Size(max = 500), 넘으면 요청 전체를 400으로 거절).
+    백엔드 장애로 밀린 줄이 500줄을 넘으면 startMs 순으로 500줄씩 나눠 보냄.
+    한 묶음이 실패하면 그 주기는 거기서 멈추고, 그 묶음과 뒤 묶음을 다음 주기에 다시 보냄
+    (백엔드가 죽어 있을 때 주기마다 요청을 여러 번 보내지 않게)
   - startMs·endMs: 회의(세션) 시작 기준 음성 밀리초 (멈춘 동안은 늘지 않음)
 
 회의 진행 알림 (CN팀 S2, 2026-10-20)
@@ -36,6 +40,7 @@ on_update(dict): 개발 화면 상태창용. 보낼 때마다 {'type': 'send', '
 import collections, datetime, http.client, json, threading, time, urllib.parse
 
 LOW, LOW_RATIO = 0.3, 0.2
+MAX_SEGMENTS = 500   # 한 요청 최대 줄 수 (meeting-service TranscriptSegmentsRequest @Size(max = 500))
 
 
 def low_confidence(text, conf):
@@ -85,9 +90,10 @@ def consume_ticket(url, ticket, timeout=3.0):
 class BackendSender:
     RETRY = 2.0   # 알림을 보내지 못했을 때 다시 시도하기까지 (초)
 
-    def __init__(self, url='', period=0.5, now=lambda: 0.0, log=print, timeout=2.0, on_update=lambda ev: None):
+    def __init__(self, url='', period=0.5, now=lambda: 0.0, log=print, timeout=2.0, on_update=lambda ev: None,
+                 max_segments=MAX_SEGMENTS):
         self.url, self.period, self.now, self.log, self.timeout = url.rstrip('/'), period, now, log, timeout
-        self.on_update = on_update
+        self.on_update, self.max_segments = on_update, max_segments
         self.lock, self.io = threading.Lock(), threading.Lock()
         self.sending = threading.Lock()   # 주기 스레드와 멈춤·종료 처리가 같은 연결로 동시에 보내지 않게
         self.meeting = None          # {'id', 't0'(엔진 초), 'logfile', 'gaps'}
@@ -190,14 +196,19 @@ class BackendSender:
     def _flush(self):
         with self.lock:
             if not self.meeting or not self.dirty: return
-            segs = sorted((dict(self.seg[i]) for i in self.dirty), key=lambda s: s['startMs'])
-            sent_ids = set(self.dirty); self.dirty = set()
+            items = sorted(((i, dict(self.seg[i])) for i in self.dirty), key=lambda x: x[1]['startMs'])
+            self.dirty = set()
             m = dict(self.meeting)
-        ok, err = self._post(m, 'transcripts', {'segments': segs})
-        with self.lock:
-            if not ok and self.meeting and self.meeting['id'] == m['id']:
-                self.dirty |= sent_ids   # 다음 주기에 그 줄들의 최신 상태를 다시 보냄
-        self._record(m, ok, err, segments=segs)
+        for k in range(0, len(items), self.max_segments):   # 평소에는 묶음 하나. 밀린 줄이 많을 때만 나눔
+            part = items[k:k + self.max_segments]
+            segs = [s for _, s in part]
+            ok, err = self._post(m, 'transcripts', {'segments': segs})
+            if not ok:
+                with self.lock:
+                    if self.meeting and self.meeting['id'] == m['id']:
+                        self.dirty |= {i for i, _ in items[k:]}   # 이 묶음과 뒤 묶음의 최신 상태를 다음 주기에 다시 보냄
+            self._record(m, ok, err, segments=segs)
+            if not ok: return
 
     def _flush_events(self):
         """큐에 쌓인 알림을 앞에서부터 하나씩. 하나라도 실패하면 멈추고 잠시 뒤 다시 함.
