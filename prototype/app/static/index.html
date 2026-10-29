@@ -502,6 +502,9 @@ function handle(ev) {
     el._d = { ...ev };
     renderLine(el); place(el);
     if (ev.type === 'recovered') { addRec(el._d); flash(el); }
+  } else if (ev.type === 'drop') {   // 엔진이 버린 말하는 중 줄: 화면에서 뺌
+    if (el?.classList.contains('partial')) { el.remove(); rows.delete(ev.id); }
+    return;
   } else if (ev.type === 'delete') {   // 지운 줄: 본문과 보완 목록에서 뺌
     el?.remove(); rows.delete(ev.id);
     const li = recs.get(ev.id);

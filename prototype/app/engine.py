@@ -23,6 +23,7 @@
   {'type': 'partial',   'id', 'start', 'text'}                          말하는 중 (같은 id가 계속 갱신)
   {'type': 'final',     'id', 'start', 'end', 'text', 'conf', 'spk', 'spk_info', 'kind'}   발화 확정. conf는 text 글자별 확신도(0~1)
   {'type': 'recovered', 'id', 'start', 'end', 'text', 'conf', 'spk', 'spk_info', 'kind'}   VAD 보완 (시각이 앞선 자리에 끼워야 함)
+  {'type': 'drop',      'id'}                                             말하는 중이던 줄을 확정 없이 버림 (끝났을 때 인식 결과가 빔)
   spk_info: 화자 판단 근거 (Diarizer.assign 참고)
   kind: 'backchannel'(맞장구) / 'filler'(간투사) / None (line_kind 참고)
   {'type': 'alt',       'id', 'alts': [{'name', 'text'}, ...]}         같은 구간의 다른 인식 결과 (기본과 다른 것만)
@@ -259,6 +260,7 @@ class Engine:
             tail = self.seg_len - (raw.timestamps[-1] if len(raw.timestamps) else 0.0)
             forced = self.seg_len >= self.max_len - 0.3 and tail < self.end_silence
             if text and cur: self._final(cur, r)
+            elif self.cur_id is not None: self.on_event({'type': 'drop', 'id': self.cur_id})   # 말하는 중으로 내보낸 줄을 버림
             self.dedup = None
             if forced and self.overlap > 0 and len(raw.timestamps):
                 self.dedup = {'t': raw.start_time - self.shift + raw.timestamps[-1], 'cut': self.fed, 'tail': squash(text)[-DEDUP_CHARS:]}
@@ -323,4 +325,5 @@ class Engine:
         while rec.is_ready(s): rec.decode_stream(s)
         r = self._trim(rec.get_result_all(s)); cur = self._span(r)
         if r.text.strip() and cur: self._final(cur, r)
+        elif self.cur_id is not None: self.on_event({'type': 'drop', 'id': self.cur_id})
         if self.alt: self.alt.drain()
