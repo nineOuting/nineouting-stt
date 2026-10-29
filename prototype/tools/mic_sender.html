@@ -166,6 +166,7 @@ function subscribe() {
       const k = ev.entry.meeting; M[k] = M[k] || {};
       const now = Date.now();
       ev.changed.forEach(s => {
+        if (s._deleted) { delete M[k][s.seq]; return; }   // 줄 삭제 (STT가 버린 말하는 중 줄)
         M[k][s.seq] = s;   // 가짜 백엔드가 이미 2.2 규칙(rev, 확정 보호)으로 걸러 바뀐 줄만 줌
         if (k !== $('mid').value) return;
         const z = seen[s.seq] = seen[s.seq] || { first: now, final: null };

@@ -134,11 +134,16 @@ clear_id = 0        # 지울 때의 엔진 줄 번호. 이 번호 이하의 말�
 def publish(ev):
     global partial, clear_at, clear_id
     with lock:
-        if (ev['type'] in ('partial', 'final') and ev['id'] <= clear_id) or (ev['type'] == 'recovered' and ev['start'] < clear_at):
+        if (ev['type'] in ('partial', 'final', 'drop') and ev['id'] <= clear_id) or (ev['type'] == 'recovered' and ev['start'] < clear_at):
             return   # 지우기 전 줄 (말하던 중이던 줄, 판단 대기 중이던 보완)
         if ev['type'] == 'partial':
             partial = ev
             if not CATCHUP[0]: BACKEND.partial(ev)   # 몰아 보내는 동안은 확정 줄만 보냄
+        elif ev['type'] == 'drop':   # 말하는 중이던 줄을 엔진이 버림: 화면에서 빼고 백엔드에 삭제로 알림 (세션 파일에는 원래 없음)
+            if partial and partial['id'] == ev['id']: partial = None
+            BACKEND.drop(ev)
+            for q in clients: q.put(ev)
+            return
         elif ev['type'] == 'send':   # 백엔드 전송 상태창 (줄에는 표시하지 않음. 0.5초마다 나가서 거의 바로 보냄)
             for q in clients: q.put(ev)
             return

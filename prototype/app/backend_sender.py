@@ -6,6 +6,7 @@
   segment: {"seq", "rev", "text", "startMs", "final"}                  말하는 중 (endMs 없음)
            {"seq", "rev", "text", "startMs", "endMs", "final": true,
             "lowConfidence", "kind", "recovered"}                      확정·보완
+           {마지막으로 보낸 값, "rev": +1, "deleted": true}             말하는 중이던 줄을 버림 (삭제)
 규칙
   - 같은 줄은 같은 seq로 매번 줄 전체 글자를 보냄. rev는 seq마다 1부터 늘어남.
     백엔드는 rev가 큰 것만 반영하고, 확정한 줄은 덮지 않음 (같은 seq가 다시 오면 버림)
@@ -22,6 +23,10 @@
     한 묶음이 실패하면 그 주기는 거기서 멈추고, 그 묶음과 뒤 묶음을 다음 주기에 다시 보냄
     (백엔드가 죽어 있을 때 주기마다 요청을 여러 번 보내지 않게)
   - startMs·endMs: 회의(세션) 시작 기준 음성 밀리초 (멈춘 동안은 늘지 않음)
+  - 삭제: 엔진이 말하는 중이던 줄을 확정 없이 버리면(drop), 보내려고 한 적이 있는 줄만 삭제로 알림.
+    다른 필드는 마지막 값 그대로 두고 rev+1, "deleted": true를 붙여 다른 줄과 묶지 않고 하나씩 보냄.
+    deleted를 모르는 백엔드는 무시하거나(rev만 올라가고 내용 그대로) 거절하므로(4xx) 어느 쪽이든 지금과 같음.
+    4xx면 다시 보내지 않고 버림. 네트워크 오류·5xx는 다음 주기에 다시 보냄. 줄이 없는데 삭제가 가면 백엔드는 무시함
 
 회의 진행 알림 (CN팀 S2, 2026-10-20)
 
@@ -98,6 +103,7 @@ class BackendSender:
         self.sending = threading.Lock()   # 주기 스레드와 멈춤·종료 처리가 같은 연결로 동시에 보내지 않게
         self.meeting = None          # {'id', 't0'(엔진 초), 'logfile', 'gaps'}
         self.seg, self.dirty = {}, set()   # seq → 최신 segment, 다음에 보낼 seq
+        self.posted, self.deletes = set(), []   # 보내려고 한 적이 있는 줄, 삭제로 알릴 줄 (앞에서부터 하나씩)
         self.events = []             # 아직 못 보낸 회의 알림 (앞에서부터 하나씩)
         self.retry_at = 0.0          # 알림 전송에 실패했을 때 다음 시도 시각
         self.history = collections.deque(maxlen=200)   # 상태창용 최근 전송 기록
@@ -119,7 +125,7 @@ class BackendSender:
             return {'url': self.url, 'period': self.period, 'stats': dict(self.stats),
                     'meeting_id': self.meeting and self.meeting['id'],
                     'logfile': self.meeting and self.meeting['logfile'],
-                    'pending_lines': len(self.dirty), 'pending_events': [dict(e) for e in self.events]}
+                    'pending_lines': len(self.dirty), 'pending_deletes': len(self.deletes), 'pending_events': [dict(e) for e in self.events]}
 
     def start(self, meeting_id, t0, logfile, first_id=0, offset_ms=0):
         """새 회의. 이전 회의에서 못 보낸 줄과 알림은 먼저 보냄.
@@ -130,6 +136,7 @@ class BackendSender:
             self.meeting = {'id': meeting_id, 't0': t0, 'logfile': logfile, 'gaps': [], 'post': post,
                             'first_id': first_id, 'seq0': int(offset_ms) // 10}
             self.seg, self.dirty, self.events = {}, set(), []
+            self.posted, self.deletes = set(), []
         if self.url and not post:
             self.log(f'회의 번호가 숫자가 아니라 백엔드로 보내지 않고 파일에만 기록함 ({meeting_id}). '
                      f'보내려면 --meeting-id로 백엔드 회의 번호를 주세요')
@@ -152,7 +159,7 @@ class BackendSender:
             seq = self._seq(ev['id'])
             if seq is None: return
             s = self.seg.get(ev['id'])
-            if s and s['final']: return
+            if s and (s['final'] or s.get('deleted')): return
             rev = s['rev'] + 1 if s else 1
             self.seg[ev['id']] = {'seq': seq, 'rev': rev, 'text': ev['text'], 'startMs': self._ms(ev['start']), 'final': False}
             self.dirty.add(ev['id'])
@@ -164,12 +171,24 @@ class BackendSender:
             seq = self._seq(ev['id'])
             if seq is None: return
             s = self.seg.get(ev['id'])
-            if s and s['final']: return
+            if s and (s['final'] or s.get('deleted')): return
             self.seg[ev['id']] = {'seq': seq, 'rev': s['rev'] + 1 if s else 1, 'text': ev['text'],
                                   'startMs': self._ms(ev['start']), 'endMs': self._ms(ev['end']), 'final': True,
                                   'lowConfidence': low_confidence(ev['text'], ev.get('conf')), 'kind': ev.get('kind'),
                                   'recovered': ev['type'] == 'recovered'}
             self.dirty.add(ev['id'])
+
+    def drop(self, ev):
+        """엔진 drop: 말하는 중이던 줄을 버림. 보내려고 한 적이 있으면 삭제로 알림 (규칙은 위 '삭제')"""
+        with self.lock:
+            if not self.meeting: return
+            s = self.seg.get(ev['id'])
+            if not s or s['final'] or s.get('deleted'): return
+            self.dirty.discard(ev['id'])   # 아직 안 나간 말하는 중 갱신은 보내지 않음
+            if ev['id'] not in self.posted:
+                del self.seg[ev['id']]; return   # 백엔드에 간 적이 없음
+            self.seg[ev['id']] = dict(s, rev=s['rev'] + 1, deleted=True)
+            self.deletes.append(ev['id'])
 
     def _flush_lines(self, wait, why):
         """바뀐 줄을 보내고, 못 보낸 줄이 남아 있으면 wait초 동안 다시 시도함"""
@@ -177,7 +196,7 @@ class BackendSender:
         t0 = time.monotonic()
         while wait > 0:
             with self.lock:
-                if not self.dirty: return
+                if not self.dirty and not self.deletes: return
             if time.monotonic() - t0 >= wait:
                 self.log(f'못 보낸 줄이 남은 채로 {why} ({wait}초 기다림)')
                 return
@@ -209,9 +228,10 @@ class BackendSender:
 
     def _flush(self):
         with self.lock:
-            if not self.meeting or not self.dirty: return
+            if not self.meeting or not (self.dirty or self.deletes): return
             items = sorted(((i, dict(self.seg[i])) for i in self.dirty), key=lambda x: x[1]['startMs'])
             self.dirty = set()
+            self.posted |= {i for i, _ in items}
             m = dict(self.meeting)
         for k in range(0, len(items), self.max_segments):   # 평소에는 묶음 하나. 밀린 줄이 많을 때만 나눔
             part = items[k:k + self.max_segments]
@@ -219,10 +239,25 @@ class BackendSender:
             ok, err = self._post(m, 'transcripts', {'segments': segs})
             if not ok:
                 with self.lock:
-                    if self.meeting and self.meeting['id'] == m['id']:
-                        self.dirty |= {i for i, _ in items[k:]}   # 이 묶음과 뒤 묶음의 최신 상태를 다음 주기에 다시 보냄
+                    if self.meeting and self.meeting['id'] == m['id']:   # 이 묶음과 뒤 묶음의 최신 상태를 다음 주기에 다시 보냄
+                        self.dirty |= {i for i, _ in items[k:] if i in self.seg and not self.seg[i].get('deleted')}
             self._record(m, ok, err, segments=segs)
             if not ok: return
+        self._flush_deletes(m)
+
+    def _flush_deletes(self, m):
+        """삭제는 다른 줄과 묶지 않고 하나씩. 4xx(deleted를 모르는 백엔드 등)면 버리고, 그 밖의 실패는 다음 주기에 다시"""
+        while True:
+            with self.lock:
+                if not self.deletes or not self.meeting or self.meeting['id'] != m['id']: return
+                i = self.deletes[0]; d = dict(self.seg[i])
+            ok, err = self._post(m, 'transcripts', {'segments': [d]})
+            self._record(m, ok, err, segments=[d])
+            rejected = not ok and err.startswith('HTTP 4')
+            if rejected: self.log(f'줄 삭제를 백엔드가 받지 않아 버림 (seq {d["seq"]}): {err}')
+            if not ok and not rejected: return
+            with self.lock:
+                if self.deletes and self.deletes[0] == i: self.deletes.pop(0)
 
     def _flush_events(self):
         """큐에 쌓인 알림을 앞에서부터 하나씩. 하나라도 실패하면 멈추고 잠시 뒤 다시 함.

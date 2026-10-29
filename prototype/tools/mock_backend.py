@@ -16,6 +16,9 @@ r"""시험용 가짜 백엔드: STT 서버(backend_sender.py)가 보내는 전�
   - 화면·저장 순서는 startMs 기준 (seq는 시간 순서가 아님, 보완 줄이 앞 시각으로 늦게 옴)
 규칙 위반으로 세는 것: 옛 rev(지금 것 이하)가 온 경우, 확정 뒤 같은 seq가 다시 온 경우
 한 요청 최대 500줄: meeting-service처럼 넘으면 요청 전체를 400으로 거절하고 하나도 반영하지 않음 (--max-segments, 0이면 검사 안 함)
+줄 삭제 (deleted: true, SCRUM-128 제안 명세): 덮어쓰기 조건(rev가 크고, 확정이 아니고, 지워지지 않음)을 따라 그 줄을 지움. 줄이 없으면 무시
+  --ignore-deleted: deleted를 모르는 지금 meeting-service처럼, 그 필드를 빼고 보통 덮어쓰기로 처리
+  --reject-unknown: 모르는 필드가 있으면 요청 전체를 400으로 거절 (모르는 필드를 거절하도록 설정된 백엔드 흉내)
 
 실행 (nineouting-stt/prototype 기준, 윈도우는 python 대신 .venv\Scripts\python, 맥은 .venv/bin/python)
   python tools/mock_backend.py              → http://localhost:8767 (확인 화면, 포트는 --port 또는 .env MOCK_PORT)
@@ -30,6 +33,8 @@ from envfile import load_env  # noqa: E402
 load_env()
 p = argparse.ArgumentParser(); p.add_argument('--port', type=int, default=os.environ.get('MOCK_PORT', 8767))
 p.add_argument('--max-segments', type=int, default=500, help='한 요청 최대 줄 수 (meeting-service와 같음). 0이면 검사 안 함')
+p.add_argument('--ignore-deleted', action='store_true', help='deleted 필드를 모르는 척하고 보통 덮어쓰기로 처리')
+p.add_argument('--reject-unknown', action='store_true', help='모르는 필드가 있으면 요청 전체를 400으로 거절 (deleted도 모르는 필드로 봄)')
 A = p.parse_args()
 lock = threading.Lock()
 meetings = {}       # meetingId → {'seg': {seq: segment}, 'stats': {...}}
@@ -41,6 +46,7 @@ PATH = re.compile(r'^/internal/meetings/([^/]+)/transcripts$')
 EVPATH = re.compile(r'^/internal/meetings/([^/]+)/events$')
 TKPATH = re.compile(r'^/internal/stt-tickets/([^/]+)/consume$')
 ISSUE = re.compile(r'^/api/meetings/([^/]+)/stt-ticket$')
+KNOWN = {'seq', 'rev', 'speakerLabel', 'text', 'startMs', 'endMs', 'final', 'lowConfidence', 'kind', 'recovered'}   # meeting-service Segment
 tickets = {}        # 입장권 → {'meetingId', 'userId', 'expires'}
 TICKET_TTL = 30.0   # 발급 뒤 유효 시간(초)
 
@@ -52,7 +58,7 @@ def push(ev):
 def mget(mid):
     return meetings.setdefault(mid, {'seg': {}, 'events': [], 'seen_events': set(),
                                      'stats': {'requests': 0, 'segments': 0, 'stale_rev': 0, 'after_final': 0,
-                                               'too_many': 0, 'events': 0, 'dup_events': 0}})
+                                               'too_many': 0, 'deleted': 0, 'unknown': 0, 'events': 0, 'dup_events': 0}})
 
 
 def apply_event(mid, ev):
@@ -77,6 +83,12 @@ def apply(mid, segs):
             st['after_final'] += 1; notes.append(f'확정 뒤 다시 옴 seq {s["seq"]} rev {s["rev"]}'); continue
         if cur and s['rev'] <= cur['rev']:
             st['stale_rev'] += 1; notes.append(f'옛 rev seq {s["seq"]} rev {s["rev"]} ≤ {cur["rev"]}'); continue
+        if A.ignore_deleted: s = {k: v for k, v in s.items() if k != 'deleted'}
+        if s.get('deleted'):   # 줄 삭제: 없으면 무시, 있으면 지움 (화면에서 뺌)
+            if cur:
+                del m['seg'][s['seq']]; st['deleted'] += 1; changed.append(dict(s, _deleted=True))
+                notes.append(f'줄 삭제 seq {s["seq"]}')
+            continue
         m['seg'][s['seq']] = dict(s, _new=cur is None); changed.append(m['seg'][s['seq']])
     return changed, notes
 
@@ -143,11 +155,15 @@ class H(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError):
             return self._send(400, '잘못된 형식'.encode())
         too_many = not failing and A.max_segments and len(segs) > A.max_segments
-        code = 503 if failing else 400 if too_many else 204
+        unknown = sorted({k for x in segs for k in x} - KNOWN) if A.reject_unknown and not failing else []
+        code = 503 if failing else 400 if too_many or unknown else 204
         with lock:
             if too_many:   # meeting-service처럼 요청 전체를 거절 (한 줄도 반영하지 않음)
                 st = mget(mt.group(1))['stats']; st['requests'] += 1; st['too_many'] += 1
                 changed, notes = [], [f'{len(segs)}줄, 한 요청 최대 {A.max_segments}줄을 넘어 400']
+            elif unknown:   # 모르는 필드 거절 모드
+                st = mget(mt.group(1))['stats']; st['requests'] += 1; st['unknown'] += 1
+                changed, notes = [], [f'모르는 필드 {", ".join(unknown)} 때문에 400']
             else:
                 changed, notes = ([], []) if failing else apply(mt.group(1), segs)
             entry = {'t': round(now - t0, 2), 'gap': gap and round(gap, 2), 'meeting': mt.group(1), 'n': len(segs),
@@ -209,7 +225,7 @@ const M={};let cur=null;const fmt=ms=>{const s=ms/1000;return String(Math.floor(
 function stats(){const m=M[cur];if(!m)return;const s=m.stats||{},seg=Object.values(m.seg);
  document.getElementById('stats').innerHTML=`<span>요청 ${s.requests||0}</span><span>받은 segment ${s.segments||0}</span>`+
  `<span>확정 줄 ${seg.filter(x=>x.final).length}</span><span>보완 줄 ${seg.filter(x=>x.recovered).length}</span>`+
- `<span>말하는 중 ${seg.filter(x=>!x.final).length}</span><span style="color:${(s.stale_rev||s.after_final||s.too_many)?'#c00':'#393'}">규칙 위반: 옛 rev ${s.stale_rev||0} · 확정 뒤 다시 옴 ${s.after_final||0} · 한 요청 줄 수 넘음 ${s.too_many||0}</span>`}
+ `<span>말하는 중 ${seg.filter(x=>!x.final).length}</span><span style="color:${(s.stale_rev||s.after_final||s.too_many)?'#c00':'#393'}">규칙 위반: 옛 rev ${s.stale_rev||0} · 확정 뒤 다시 옴 ${s.after_final||0} · 한 요청 줄 수 넘음 ${s.too_many||0}</span><span>줄 삭제 ${s.deleted||0} · 모르는 필드 거절 ${s.unknown||0}</span>`}
 function render(flash){const m=M[cur];const el=document.getElementById('lines');if(!m){el.innerHTML='';return}
  const atBottom=el.parentNode.scrollTop+el.parentNode.clientHeight>=el.parentNode.scrollHeight-40;
  el.innerHTML=Object.values(m.seg).sort((a,b)=>a.startMs-b.startMs).map(s=>
@@ -227,7 +243,7 @@ const es=new EventSource('/events');es.onmessage=x=>{const ev=JSON.parse(x.data)
  if(ev.type==='snap'){for(const[k,v]of Object.entries(ev.meetings)){M[k]={seg:{},stats:v.stats};v.seg.forEach(s=>M[k].seg[s.seq]=s)}
   cur=Object.keys(M).pop()||null;ev.log.forEach(logRow);sel();render()}
  else if(ev.type==='req'){const k=ev.entry.meeting;if(!M[k]){M[k]={seg:{},stats:{}};cur=k;sel()}
-  ev.changed.forEach(s=>M[k].seg[s.seq]=s);if(ev.stats)M[k].stats=ev.stats;logRow(ev.entry);
+  ev.changed.forEach(s=>{if(s._deleted)delete M[k].seg[s.seq];else M[k].seg[s.seq]=s});if(ev.stats)M[k].stats=ev.stats;logRow(ev.entry);
   if(k===cur)render(new Set(ev.changed.filter(s=>s._new).map(s=>s.seq)))}
  else if(ev.type==='fail'){const b=document.getElementById('banner');let n=ev.until;b.textContent=`503으로 답하는 중 ${n}초`;
   const t=setInterval(()=>{n--;b.textContent=n>0?`503으로 답하는 중 ${n}초`:'';if(n<=0)clearInterval(t)},1000)}};
