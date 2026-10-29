@@ -184,7 +184,8 @@ SESS = None        # 지금 세션: file, wav_path, wav(쓰는 중인 wave 객�
 CTRL = queue.Queue()   # 화면의 녹음·일시정지·완료 요청. 소리 입력 스레드가 소리 조각 사이에 처리함
 
 
-def new_session(t0, path=None, mid=None):
+def new_session(t0, path=None, mid=None, offset=0.0):
+    """offset: --input ws에서 start의 offsetMs(초). 백엔드 seq 시작값을 정함 (STT가 다시 켜져도 앞서 보낸 줄과 겹치지 않게)"""
     global SESS
     os.makedirs(A.save_dir, exist_ok=True)
     base = path or os.path.join(A.save_dir, datetime.datetime.now().strftime('%Y%m%d_%H%M%S') + '.jsonl')
@@ -192,7 +193,8 @@ def new_session(t0, path=None, mid=None):
     mid = mid or (A.meeting_id if A.meeting_id and SESS is None else '') or 'm_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     SESS = {'file': base, 'wav_path': None, 'wav': None, 'wav_t0': None, 't0': round(t0, 2), 'meeting_id': mid,
             'started': datetime.datetime.now().isoformat(timespec='seconds'), 'complete': False}
-    BACKEND.start(mid, t0, os.path.splitext(base)[0] + '.backend.jsonl')
+    BACKEND.start(mid, t0, os.path.splitext(base)[0] + '.backend.jsonl',
+                  first_id=ENGINE.next_id if ENGINE else 0, offset_ms=round(offset * 1000))
     status['session'] = os.path.basename(base); status['rec'] = False; status['rec_sec'] = 0.0
 
 
@@ -238,7 +240,7 @@ def control(eng, act):
     if isinstance(act, tuple) and act[0] == 'start':   # --input ws: 브라우저가 회의 시작을 알림 (meetingId, 회의 시작 기준 음성 초)
         _, mid, off = act
         if st in ('run', 'pause'): control(eng, 'complete')   # 다른 회의가 열려 있으면 닫음
-        with lock: new_session(eng.fed - off, mid=mid)          # 줄 시각 = 회의 시작 기준 음성 시간이 되도록 기준점을 맞춤
+        with lock: new_session(eng.fed - off, mid=mid, offset=off)   # 줄 시각 = 회의 시작 기준 음성 시간이 되도록 기준점을 맞춤
         publish({'type': 'clear', 'session_switch': True})
         status['state'] = 'run'
         with lock: save_session()

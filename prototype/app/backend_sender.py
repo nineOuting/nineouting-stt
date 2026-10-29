@@ -7,8 +7,12 @@
            {"seq", "rev", "text", "startMs", "endMs", "final": true,
             "lowConfidence", "kind", "recovered"}                      확정·보완
 규칙
-  - 같은 줄은 같은 seq(엔진 줄 id)로 매번 줄 전체 글자를 보냄. rev는 seq마다 1부터 늘어남.
-    백엔드는 rev가 큰 것만 반영하고, final: true는 false로 덮지 않음
+  - 같은 줄은 같은 seq로 매번 줄 전체 글자를 보냄. rev는 seq마다 1부터 늘어남.
+    백엔드는 rev가 큰 것만 반영하고, 확정한 줄은 덮지 않음 (같은 seq가 다시 오면 버림)
+  - seq = 시작값 + 세션 안 줄 번호(1부터). 시작값은 start의 offsetMs // 10
+    STT가 회의 도중 다시 켜져 줄 번호가 1부터 다시 세어져도, 같은 회의 안에서 앞서 보낸 seq와 겹치지 않게 함.
+    앞선 줄은 모두 offsetMs보다 앞에서 생겼으므로, 회의 음성 1초에 100줄을 넘지 않는 한 겹치지 않음
+    (INT 상한 약 21억 → 회의 길이 248일까지)
   - period(기본 0.5초)마다 그사이 바뀐 줄만 최신 상태로 보냄. 말하는 중 줄은 최신 것 하나만. 바뀐 것이 없으면 보내지 않음
   - 확정한 줄은 다시 보내지 않음 (확정 뒤 수정·삭제는 백엔드가 처리)
   - 보완 줄은 말하는 중 단계 없이 final·recovered로 바로 오고, 앞 시각에 끼워질 수 있음 (seq는 시간 순서가 아님)
@@ -111,12 +115,14 @@ class BackendSender:
                     'logfile': self.meeting and self.meeting['logfile'],
                     'pending_lines': len(self.dirty), 'pending_events': [dict(e) for e in self.events]}
 
-    def start(self, meeting_id, t0, logfile):
-        """새 회의. 이전 회의에서 못 보낸 줄과 알림은 먼저 보냄"""
+    def start(self, meeting_id, t0, logfile, first_id=0, offset_ms=0):
+        """새 회의. 이전 회의에서 못 보낸 줄과 알림은 먼저 보냄.
+        first_id: 지금 엔진의 마지막 줄 번호 (이 뒤 번호부터 이 회의의 줄), offset_ms: start의 offsetMs"""
         self.flush(); self._flush_events()
         post = str(meeting_id).isdigit()   # 백엔드 주소는 숫자 회의 번호만 받음 (CN팀 S5)
         with self.lock:
-            self.meeting = {'id': meeting_id, 't0': t0, 'logfile': logfile, 'gaps': [], 'post': post}
+            self.meeting = {'id': meeting_id, 't0': t0, 'logfile': logfile, 'gaps': [], 'post': post,
+                            'first_id': first_id, 'seq0': int(offset_ms) // 10}
             self.seg, self.dirty, self.events = {}, set(), []
         if self.url and not post:
             self.log(f'회의 번호가 숫자가 아니라 백엔드로 보내지 않고 파일에만 기록함 ({meeting_id}). '
@@ -128,23 +134,32 @@ class BackendSender:
         with self.lock:
             if self.meeting: self.meeting['gaps'].append((at, dur))
 
+    def _seq(self, eid):
+        """엔진 줄 번호 → 백엔드 seq. 이 회의 전에 생긴 줄이면 None"""
+        n = eid - self.meeting['first_id']
+        return self.meeting['seq0'] + n if n > 0 else None
+
     def partial(self, ev):
         """엔진 partial: 말하는 중 줄. 이미 확정한 줄이면 무시"""
         with self.lock:
             if not self.meeting: return
+            seq = self._seq(ev['id'])
+            if seq is None: return
             s = self.seg.get(ev['id'])
             if s and s['final']: return
             rev = s['rev'] + 1 if s else 1
-            self.seg[ev['id']] = {'seq': ev['id'], 'rev': rev, 'text': ev['text'], 'startMs': self._ms(ev['start']), 'final': False}
+            self.seg[ev['id']] = {'seq': seq, 'rev': rev, 'text': ev['text'], 'startMs': self._ms(ev['start']), 'final': False}
             self.dirty.add(ev['id'])
 
     def line(self, ev):
         """엔진 final·recovered: 확정. 한 번만 보냄"""
         with self.lock:
             if not self.meeting: return
+            seq = self._seq(ev['id'])
+            if seq is None: return
             s = self.seg.get(ev['id'])
             if s and s['final']: return
-            self.seg[ev['id']] = {'seq': ev['id'], 'rev': s['rev'] + 1 if s else 1, 'text': ev['text'],
+            self.seg[ev['id']] = {'seq': seq, 'rev': s['rev'] + 1 if s else 1, 'text': ev['text'],
                                   'startMs': self._ms(ev['start']), 'endMs': self._ms(ev['end']), 'final': True,
                                   'lowConfidence': low_confidence(ev['text'], ev.get('conf')), 'kind': ev.get('kind'),
                                   'recovered': ev['type'] == 'recovered'}
