@@ -87,7 +87,7 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 | 서버 시작에서 `WinError 10013` 또는 `Address already in use` | 그 포트를 다른 프로그램이 쓰거나 윈도우가 예약함. `.env`에서 `STT_PORT`·`WS_PORT`·`MOCK_PORT`를 바꿈 |
 | 모델 파일이 있는데 열지 못함 (윈도우) | 경로에 한글이 있으면 생길 수 있음 (미확인). `.env`의 `NINEOUTING_STT_MODELS`를 `C:\nineouting\models` 같은 영문 경로로 두고 모델을 다시 받음 |
 | 마이크 장치를 열지 못함 | `--list-devices`로 목록을 보고 `--device 번호`로 다른 장치를 고름 |
-| 끄는 중에 멈춘 것 같음 | 저장에 최대 약 10초 걸림. 그래도 안 꺼지면 맥은 Ctrl+\, 윈도우는 터미널 창 닫기 |
+| 끄는 중에 멈춘 것 같음 | 저장에 최대 약 10초 걸림 (백엔드가 응답하지 않으면 줄 전송을 2초 시도한 뒤 끔). 그래도 안 꺼지면 맥은 Ctrl+\, 윈도우는 터미널 창 닫기 |
 
 ## 확인용 화면
 
@@ -155,6 +155,7 @@ docker run -p 8770:8770 -e BACKEND_URL=http://meeting-service:8083 ghcr.io/nineo
 - 모델은 이미지 안에 들어 있어(약 160MB) 실행할 때 받지 않습니다
 - 기본값으로 음성 포트만 열립니다 (`WS_HOST=0.0.0.0`, `STT_HOST=127.0.0.1`). 개발 화면은 로그인이 없으므로 운영에서 열지 마세요
 - 상태 확인: `GET :8770/health`
+- 끄기: `docker stop`·쿠버네티스가 보내는 SIGTERM을 받으면 말하던 줄을 확정하고 남은 줄을 보낸 뒤 바로 끝납니다. **회의 `end` 알림은 보내지 않습니다** (파드를 내리는 것이지 회의가 끝난 것이 아니고, 새 STT에 브라우저가 `offsetMs`로 이어 붙음). 터미널에서 Ctrl+C로 끄면 지금처럼 `end`까지 보냅니다
 
 직접 만들려면 `docker build -t nineouting-stt prototype/` 입니다. 빌드 컨텍스트가 `prototype/`입니다.
 

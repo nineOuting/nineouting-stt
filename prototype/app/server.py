@@ -665,7 +665,18 @@ class H(BaseHTTPRequestHandler):
             self.send_response(403); self.end_headers()
 
 
+STOP_BY = ['']   # 끈 신호: 'SIGTERM'이면 회의 end 알림을 보내지 않음
+
+
+def on_sigterm(signum, frame):
+    """docker stop·쿠버네티스가 파드를 내릴 때 오는 SIGTERM. Ctrl+C와 같은 정리 경로를 탐.
+    처리 함수를 걸어야 컨테이너 1번 프로세스로 돌 때도 SIGTERM을 받음 (걸지 않으면 무시되어 SIGKILL까지 기다림)"""
+    STOP_BY[0] = 'SIGTERM'
+    raise KeyboardInterrupt
+
+
 def main():
+    signal.signal(signal.SIGTERM, on_sigterm)
     th = threading.Thread(target=audio_loop, daemon=True); th.start()
     srv = ThreadingHTTPServer((A.host, A.port), H); srv.daemon_threads = True
     if ENV_LOADED: print(f'설정 파일: {ENV_LOADED}', flush=True)
@@ -676,18 +687,27 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # 정리(마이크 끄기·저장)는 최대 약 10초. 그 사이 Ctrl+C를 또 누르면 저장이 끊기므로 무시함 (강제 종료는 맥 Ctrl+\, 윈도우는 터미널 창 닫기)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        print('\n끄는 중… 녹음·전사 파일을 저장하고 있으니 잠시 기다려 주세요 (최대 약 10초)', flush=True)
+        # 정리(마이크 끄기·저장)는 최대 약 10초. 그 사이 Ctrl+C·SIGTERM이 또 오면 저장이 끊기므로 무시함 (강제 종료는 맥 Ctrl+\, 윈도우는 터미널 창 닫기)
+        signal.signal(signal.SIGINT, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        term = STOP_BY[0] == 'SIGTERM'
+        t_stop = time.monotonic()
+        print(f'\n끄는 중{" (SIGTERM)" if term else ""}… 녹음·전사 파일을 저장하고 있으니 잠시 기다려 주세요 (최대 약 10초)', flush=True)
         stop.set()
-        th.join(timeout=5)
+        th.join(timeout=5)   # 소리 처리를 멈추고 말하던 줄을 확정함 (eng.finish)
+        with lock: rec_close(); ending = bool(SESS and not SESS['complete'])
+        # 백엔드 전송은 lock 밖에서 함. 전송 스레드가 BACKEND.sending을 잡은 채 화면 알림(publish)으로 lock을 기다리므로,
+        # lock을 잡고 보내면 서로 기다려 멈춤 (백엔드가 응답하지 못할 때 드러남)
+        if ending and not term:
+            BACKEND.event('end', wait_lines=2.0)   # Ctrl+C: 완료를 누르지 않고 끈 경우 회의를 끝냄
+        else:
+            # SIGTERM: 파드를 내리는 것이지 회의가 끝난 것이 아님. 새 STT에 브라우저가 offsetMs로 이어 붙으므로 end를 보내지 않음
+            BACKEND.drain(wait=2.0)
+            if ending: print('회의는 끝내지 않음 (end 알림을 보내지 않음)', flush=True)
         with lock:
-            rec_close()
-            BACKEND.flush()
-            if SESS and not SESS['complete']: BACKEND.event('end', wait_lines=2.0)   # 완료를 누르지 않고 끈 경우
             if SESS:
                 save_session(); print(f'전사문 저장: {SESS["file"]}' + (f'  녹음: {SESS["wav_path"]}' if SESS['wav_path'] else ''))
         srv.server_close()
+        print(f'정리 {time.monotonic() - t_stop:.1f}초', flush=True)
 
 
 if __name__ == '__main__':

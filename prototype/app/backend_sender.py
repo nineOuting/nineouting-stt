@@ -171,22 +171,36 @@ class BackendSender:
                                   'recovered': ev['type'] == 'recovered'}
             self.dirty.add(ev['id'])
 
+    def _flush_lines(self, wait, why):
+        """바뀐 줄을 보내고, 못 보낸 줄이 남아 있으면 wait초 동안 다시 시도함"""
+        self.flush()
+        t0 = time.monotonic()
+        while wait > 0:
+            with self.lock:
+                if not self.dirty: return
+            if time.monotonic() - t0 >= wait:
+                self.log(f'못 보낸 줄이 남은 채로 {why} ({wait}초 기다림)')
+                return
+            time.sleep(0.2); self.flush()
+
     def event(self, name, wait_lines=0.0):
         """회의 알림을 큐에 넣고 보냄. 앞선 줄을 먼저 보냄.
         wait_lines초: 못 보낸 줄이 남아 있으면 그동안 다시 시도함 (end가 줄보다 먼저 가지 않게)"""
-        self.flush()
-        t0 = time.monotonic()
-        while wait_lines > 0:
-            with self.lock:
-                if not self.dirty: break
-            if time.monotonic() - t0 >= wait_lines:
-                self.log(f'못 보낸 줄이 남은 채로 {name} 알림을 보냄 ({wait_lines}초 기다림)')
-                break
-            time.sleep(0.2); self.flush()
+        self._flush_lines(wait_lines, f'{name} 알림을 보냄')
         with self.lock:
             if not self.meeting: return
             self.events.append({'event': name, 'atMs': self._ms(self.now())})
         self._flush_events()
+
+    def drain(self, wait=2.0):
+        """끌 때: 남은 줄과 못 보낸 알림을 보냄. 회의 알림을 새로 만들지 않음 (SIGTERM은 회의 끝이 아님).
+        알림 재시도 간격(RETRY)을 기다리지 않고 바로 한 번 더 시도함"""
+        self._flush_lines(wait, '끔')
+        self.retry_at = 0.0
+        self._flush_events()
+        with self.lock:
+            left = len(self.events)
+        if left: self.log(f'못 보낸 회의 알림 {left}개를 남긴 채로 끔')
 
     def flush(self):
         """바뀐 줄을 지금 보냄 (주기마다, 멈춤·완료·종료 때)"""
