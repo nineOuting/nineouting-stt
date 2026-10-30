@@ -3,8 +3,10 @@
 #
 # 플랫폼: linux/amd64와 linux/arm64(CN팀 노드)를 각자의 빌드 서버에서 만들고, 하나의 태그로 묶음.
 #         받는 쪽은 자기 CPU에 맞는 이미지를 자동으로 받음 (일부러 고르려면 docker pull --platform linux/amd64 ...)
-# 태그: 브랜치 이름 + 커밋 SHA (ai-service·백엔드 서비스 레포와 같은 모양)
+# 태그: develop 푸시 -> develop + 커밋 SHA (ai-service·백엔드 서비스 레포와 같은 모양)
+#       릴리스 git 태그(v<major>.<minor>.<patch>, 예: v0.1.0) 푸시 -> 같은 이름 + 커밋 SHA (develop 은 옮기지 않음)
 # 끌어 쓰기: docker pull ghcr.io/nineouting/nineouting-stt:develop
+#            docker pull ghcr.io/nineouting/nineouting-stt:v0.1.0
 #
 # 옛 이미지 정리(delete-package-versions)는 두지 않음: 묶음 안쪽 플랫폼 이미지가 GHCR에서 "태그 없는 버전"으로 보여
 # 태그 없는 버전을 지우면 develop 이미지가 깨짐. 공개 패키지라 저장 공간 비용은 없음
@@ -13,6 +15,8 @@ name: image
 on:
   push:
     branches: [develop]
+    # 릴리스 태그: git tag v0.1.0 && git push origin v0.1.0 (태그 푸시에는 아래 paths 조건이 적용되지 않음)
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
     paths:
       - 'prototype/**'
       - '.github/workflows/image.yml'
@@ -124,7 +128,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # 두 플랫폼 이미지를 하나의 태그(develop, 커밋 SHA)로 묶음
+  # 두 플랫폼 이미지를 하나의 태그(develop 또는 릴리스 태그, 커밋 SHA)로 묶음
   merge:
     needs: build
     if: github.event_name != 'pull_request'
@@ -151,9 +155,16 @@ jobs:
       - name: 하나의 태그로 묶기
         working-directory: ${{ runner.temp }}/digests
         run: |
+          # 릴리스 태그 푸시는 릴리스 이름과 SHA, develop 푸시는 develop 과 SHA 를 붙임 (릴리스가 develop 을 옮기지 않게)
+          tags=(-t "${IMAGE}:${GITHUB_SHA}")
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tags+=(-t "${IMAGE}:${GITHUB_REF_NAME}")
+          else
+            tags+=(-t "${IMAGE}:develop")
+          fi
           docker buildx imagetools create \
             --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            -t "${IMAGE}:develop" -t "${IMAGE}:${GITHUB_SHA}" \
+            "${tags[@]}" \
             $(printf "${IMAGE}@sha256:%s " *)
 
       - name: 두 플랫폼이 들어갔는지 확인
