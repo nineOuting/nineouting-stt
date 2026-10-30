@@ -218,3 +218,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- nineouting-stt ---
+# 모델 파일: 용량이 커서(파일당 100MB 초과 포함) 올리지 않음. 배포처에서 받음
+models/
+*.onnx
+*.pt
+# 회의 전사문·녹음: 개인정보, 절대 올리지 않음
+transcripts/
+*.wav
+*.m4a
+*.jsonl
+# macOS
+.DS_Store
+# 이 Mac 전용 실행 설정 (절대 경로 포함)
+.claude/launch.json
+
+# 개인 AI 도구 설정 (각자 로컬에 둠. 레포 공통 규칙은 AGENTS.md)
+CLAUDE.md
+CLAUDE.local.md
