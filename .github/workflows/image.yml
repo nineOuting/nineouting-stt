@@ -357,3 +357,41 @@ jobs:
             ecr-manifest.txt
             ecr-manifest-raw.json
           retention-days: 30
+
+  dev-gitops:
+    name: Create verified STT DEV image PR
+    needs: dev-ecr
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: dev-gitops-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Check GitOps token registration
+        env:
+          DEV_GITOPS_TOKEN: ${{ secrets.DEV_GITOPS_TOKEN }}
+        run: |
+          if [ -z "$DEV_GITOPS_TOKEN" ]; then
+            echo '::error::Register DEV_GITOPS_TOKEN with infra Contents/Pull requests write access'
+            exit 1
+          fi
+      - name: Checkout infrastructure promotion tool
+        uses: actions/checkout@v4
+        with:
+          repository: nineOuting/nineouting-infra
+          ref: dev
+          token: ${{ secrets.DEV_GITOPS_TOKEN }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: dev-ecr-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verified-image
+      - name: Create verified STT values PR
+        run: python3 scripts/dev/promote-image.py
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DEV_GITOPS_TOKEN: ${{ secrets.DEV_GITOPS_TOKEN }}
