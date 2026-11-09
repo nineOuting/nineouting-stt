@@ -130,6 +130,8 @@ jobs:
 
   # 두 플랫폼 이미지를 하나의 태그(develop 또는 릴리스 태그, 커밋 SHA)로 묶음
   merge:
+    outputs:
+      image_digest: ${{ steps.merge.outputs.digest }}
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -153,6 +155,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 하나의 태그로 묶기
+        id: merge
         working-directory: ${{ runner.temp }}/digests
         run: |
           # 릴리스 태그 푸시는 릴리스 이름과 SHA, develop 푸시는 develop 과 SHA 를 붙임 (릴리스가 develop 을 옮기지 않게)
@@ -162,13 +165,192 @@ jobs:
           else
             tags+=(-t "${IMAGE}:develop")
           fi
-          docker buildx imagetools create \
+          sources=()
+          for digest_file in *; do sources+=("${IMAGE}@sha256:${digest_file}"); done
+          docker buildx imagetools create --metadata-file "$RUNNER_TEMP/stt-merge-metadata.json" \
             --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
             "${tags[@]}" \
-            $(printf "${IMAGE}@sha256:%s " *)
+            "${sources[@]}"
+          digest=$(jq -er '.["containerimage.digest"]' "$RUNNER_TEMP/stt-merge-metadata.json")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: 두 플랫폼이 들어갔는지 확인
         run: |
           docker buildx imagetools inspect "${IMAGE}:${GITHUB_SHA}" | tee inspect.txt
           grep -q "linux/amd64" inspect.txt && grep -q "linux/arm64" inspect.txt
           echo "묶음 확인: linux/amd64, linux/arm64" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  dev-ecr:
+    name: Verify and publish DEV ECR image
+    needs: merge
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    env:
+      AWS_REGION: ap-northeast-2
+      EXPECTED_ACCOUNT: '443845329525'
+      SOURCE_IMAGE: ghcr.io/nineouting/nineouting-stt
+      SOURCE_DIGEST: ${{ needs.merge.outputs.image_digest }}
+      TARGET_IMAGE: 443845329525.dkr.ecr.ap-northeast-2.amazonaws.com/nineouting-dev-stt
+
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to existing GHCR image
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Authenticate to DEV with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::443845329525:role/nineouting-dev-stt-github
+          aws-region: ap-northeast-2
+          role-session-name: gha-${{ github.run_id }}
+
+      - name: Check account
+        shell: bash
+        run: |
+          set -euo pipefail
+          account=$(aws sts get-caller-identity --query Account --output text)
+          test "$account" = "$EXPECTED_ACCOUNT"
+          echo "AWS account verified: $account"
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Publish and verify AMD64 image in ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1. 이번 CI에서 생성한 이미지 Digest 검증
+          [[ "$SOURCE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          source="$SOURCE_IMAGE@$SOURCE_DIGEST"
+          tag="sha-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          target="$TARGET_IMAGE:$tag"
+
+          # 2. GHCR의 멀티 아키텍처 Manifest 조회
+          docker buildx imagetools inspect --raw "$source" \
+            > ghcr-index.json
+
+          # 3. EKS에서 사용할 AMD64 Manifest만 선택
+          amd64_digest=$(jq -er '
+            [
+              .manifests[]
+              | select(
+                  .platform.os == "linux"
+                  and .platform.architecture == "amd64"
+                )
+              | .digest
+            ]
+            | if length == 1
+              then .[0]
+              else error("Expected exactly one linux/amd64 image")
+              end
+          ' ghcr-index.json)
+
+          [[ "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          # 원본 AMD64 이미지 Manifest 저장
+          docker buildx imagetools inspect --raw \
+            "$SOURCE_IMAGE@$amd64_digest" \
+            > ghcr-amd64-manifest.json
+
+          # 4. GHCR의 AMD64 이미지를 ECR로 복사
+          # 단일 플랫폼 Manifest 형식 유지
+          docker buildx imagetools create \
+            --prefer-index=false \
+            --tag "$target" \
+            "$SOURCE_IMAGE@$amd64_digest"
+
+          # 5. ECR에 게시된 이미지 Digest 확인
+          docker buildx imagetools inspect "$target" \
+            > ecr-manifest.txt
+
+          digest=$(awk '$1 == "Digest:" {print $2; exit}' \
+            ecr-manifest.txt)
+
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          # ECR 레지스트리의 실제 Manifest 조회
+          docker buildx imagetools inspect --raw \
+            "$TARGET_IMAGE@$digest" \
+            > ecr-manifest-raw.json
+
+          # 6. GHCR 원본과 ECR 이미지 구성 비교
+          source_config=$(jq -er '.config.digest' \
+            ghcr-amd64-manifest.json)
+
+          target_config=$(jq -er '.config.digest' \
+            ecr-manifest-raw.json)
+
+          [[ "$source_config" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$target_config" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          if [[ "$source_config" != "$target_config" ]]; then
+            echo "::error::GHCR/ECR image config digest mismatch"
+            exit 1
+          fi
+
+          # 이미지 레이어 Digest 비교
+          source_layers=$(jq -c '[.layers[].digest]' \
+            ghcr-amd64-manifest.json)
+
+          target_layers=$(jq -c '[.layers[].digest]' \
+            ecr-manifest-raw.json)
+
+          if [[ "$source_layers" != "$target_layers" ]]; then
+            echo "::error::GHCR/ECR image layer mismatch"
+            exit 1
+          fi
+
+          # 7. 실제 ECR 이미지 다운로드 및 플랫폼 검증
+          docker pull --platform linux/amd64 \
+            "$TARGET_IMAGE@$digest"
+
+          target_platform=$(docker image inspect \
+            "$TARGET_IMAGE@$digest" \
+            --format '{{.Os}}/{{.Architecture}}')
+
+          if [[ "$target_platform" != "linux/amd64" ]]; then
+            echo "::error::ECR image is not linux/amd64"
+            exit 1
+          fi
+
+          # 8. GitOps 배포에서 사용할 이미지 주소 저장
+          image_uri="$TARGET_IMAGE@$digest"
+
+          printf 'image.repository=%s\nimage.digest=%s\nimage.tag=%s\nimage.uri=%s\n' \
+            "$TARGET_IMAGE" "$digest" "$tag" "$image_uri" \
+            > image-result.txt
+
+          # 9. GitHub Actions 실행 결과 요약
+          {
+            echo '## DEV ECR Publish PASS'
+            echo "- Source: $source"
+            echo "- Source AMD64 digest: $amd64_digest"
+            echo "- Target: $target"
+            echo "- ECR image: $image_uri"
+            echo "- Platform: $target_platform"
+            echo '- Registry image config/layers: MATCH'
+            echo '- Deployment: NOT RUN'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save verified image reference
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-ecr-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            image-result.txt
+            ecr-manifest.txt
+            ecr-manifest-raw.json
+          retention-days: 30
