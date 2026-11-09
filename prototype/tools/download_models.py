@@ -11,7 +11,7 @@
 - 받는 동안은 <이름>.part에 쓰고, 체크섬이 맞을 때만 원래 이름으로 바꿈. 맞지 않으면 지우고 알림
 - 프록시가 필요하면 HTTPS_PROXY 환경 변수를 씀 (urllib 기본 동작)
 """
-import argparse, hashlib, os, sys, time, urllib.request
+import argparse, hashlib, os, sys, time, urllib.request, urllib.error
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # prototype/
 sys.path.insert(0, os.path.join(ROOT, 'app'))
@@ -47,7 +47,7 @@ def mb(n):
     return f'{n / 1e6:.1f}MB'
 
 
-def download(url, dest, size):
+def download_once(url, dest, size):
     part = dest + '.part'
     req = urllib.request.Request(url, headers={'User-Agent': 'nineouting-stt-download-models'})
     with urllib.request.urlopen(req, timeout=60) as r, open(part, 'wb') as f:
@@ -61,6 +61,23 @@ def download(url, dest, size):
                 print(f'\r    {mb(got)} / {mb(total)} ({got / max(total, 1) * 100:.0f}%)', end='', flush=True)
     print()
     return part
+
+
+def download(url, dest, size):
+    # Retry transient transport failures only; main still verifies SHA-256.
+    for attempt in range(3):
+        try:
+            return download_once(url, dest, size)
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            part = dest + '.part'
+            if os.path.exists(part):
+                os.remove(part)
+            transient = not isinstance(error, urllib.error.HTTPError) or error.code in (429, 500, 502, 503, 504)
+            if not transient or attempt == 2:
+                raise
+            delay = 2 ** (attempt + 1)
+            print(f'    일시적 다운로드 오류; {delay}초 후 재시도 ({attempt + 2}/3)')
+            time.sleep(delay)
 
 
 def main():
