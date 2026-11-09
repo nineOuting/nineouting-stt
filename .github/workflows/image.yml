@@ -49,6 +49,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 모델 다운로드 재시도 단위 검증
+        run: python3 -m unittest discover -s prototype/tools -p test_download_models.py
+
       - uses: docker/setup-buildx-action@v3
 
       # pull_request에서는 만들어만 보고 올리지 않음 (고치는 중에 이미지가 쌓이지 않게)
