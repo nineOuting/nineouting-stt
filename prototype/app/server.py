@@ -43,6 +43,7 @@ from envfile import load_env  # noqa: E402
 ENV_LOADED = load_env()   # engine의 모델 폴더 기본값(NINEOUTING_STT_MODELS)도 .env를 따르도록 engine보다 먼저
 from engine import Engine, SR, DEFAULT_MODELS, DEFAULTS, line_kind  # noqa: E402
 from backend_sender import BackendSender, consume_ticket  # noqa: E402
+from drain import draining  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 p = argparse.ArgumentParser()
@@ -302,7 +303,8 @@ def health():
     프로세스는 떠 있는데 전사가 멈춘 상태를 밖에서 알 수 있게 함"""
     ok = bool(status['running'])
     body = {'ok': ok, 'input': A.input, 'state': status['state'],
-            'meeting': SESS and SESS['meeting_id'], 'audioSec': status['audio_sec']}
+            'meeting': SESS and SESS['meeting_id'], 'audioSec': status['audio_sec'],
+            'connected': WS['conn'] is not None, 'draining': draining()}
     if not ok and status.get('error'): body['error'] = status['error']
     return (200 if ok else 503), json.dumps(body, ensure_ascii=False).encode() + b'\n'
 
@@ -310,11 +312,17 @@ def health():
 def ws_process_request(conn, request):
     """음성 포트로 오는 평범한 HTTP GET. 상태 확인만 받고, 나머지는 WebSocket 손잡기로 넘김.
     이 포트는 밖으로 열려 있어서(WS_HOST=0.0.0.0) 컨테이너 밖에서도 닿음. 개발 화면 포트는 닫아 둠"""
-    if request.path.split('?')[0] != '/health': return None
+    path = request.path.split('?')[0]
+    if path not in ('/health', '/ready') and not draining(): return None
     from http import HTTPStatus
     from websockets.datastructures import Headers
     from websockets.http11 import Response
     code, body = health()
+    if path == '/ready' and draining():
+        code, body = 503, b'{"ready":false,"draining":true}\n'
+    elif path not in ('/health', '/ready'):
+        # Do not consume a one-use ticket on a retiring process.
+        code, body = 503, b'{"error":"draining"}\n'
     st = HTTPStatus(code)
     return Response(st.value, st.phrase,
                     Headers([('Content-Type', 'application/json; charset=utf-8'),

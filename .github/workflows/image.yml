@@ -118,6 +118,9 @@ jobs:
           print('모델 확인 uid=%d arch=%s 전사 폴더 쓰기 됨' % (os.getuid(), platform.machine()))
           " | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: 배포 연결 유지 검증
+        run: docker run --rm --network none "$REF" python -m unittest discover -s tools -p 'test_drain*.py'
+
       - name: digest 넘기기
         if: github.event_name != 'pull_request'
         run: |
