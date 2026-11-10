@@ -174,7 +174,7 @@ jobs:
             --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
             "${tags[@]}" \
             "${sources[@]}"
-          digest=$(jq -er '.["containerimage.digest"]' "$RUNNER_TEMP/stt-merge-metadata.json")
+          digest=$(jq -er '.["containerimage.descriptor"].digest' "$RUNNER_TEMP/stt-merge-metadata.json")
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
