@@ -83,7 +83,9 @@ jobs:
         with:
           context: prototype
           platforms: ${{ matrix.platform }}
-          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.pair }}
           cache-to: type=gha,scope=${{ matrix.pair }},mode=max
