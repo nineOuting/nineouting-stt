@@ -32,7 +32,8 @@ http://localhost:8765 에서 열림. 녹음은 화면의 "녹음 시작"을 눌�
 여러 회의 (--input ws, SCRUM-288)
   모델(Shared)은 한 번만 올리고, 회의마다 Room(엔진 상태·세션 파일·백엔드 전송·소리 대기열·처리 스레드)을 따로 둠
   접속 포트는 하나. 연결마다 받는 스레드가 meetingId에 맞는 Room 대기열에 소리를 넣고, Room의 처리 스레드가 인식함
-  동시에 여는 회의는 --max-meetings개까지. 다 차면 /ready가 503이 되고, 그래도 들어온 새 회의 연결은 1013으로 닫음
+  동시에 여는 회의는 --max-meetings개까지. 다 차면 새 회의 연결은 1013으로 닫음
+  /ready는 다 차도 200으로 둠: DEV는 파드가 하나라 /ready가 503이 되면 ALB 대상에서 빠져, 진행 중인 회의의 다시 연결까지 막힘
   연결 없이 --idle-release초가 지난 회의는 남은 줄을 보내고 end 없이 정리함 (나중에 붙으면 offsetMs로 이어 감)
   개발 화면은 주소 뒤 ?m=회의번호로 회의를 고름 (없으면 가장 최근에 시작한 회의)
   마이크·wav 입력은 지금처럼 Room 하나
@@ -85,7 +86,7 @@ p.add_argument('--backend-url', default=os.environ.get('BACKEND_URL', ''),
 p.add_argument('--backend-period', type=float, default=0.5, help='백엔드 전송 주기(초). 그사이 바뀐 줄만 보냄')
 p.add_argument('--meeting-id', default='', help='첫 회의의 회의 번호 (백엔드가 쓰는 숫자). 없으면 자동 이름을 붙이고 백엔드로는 보내지 않음')
 p.add_argument('--max-meetings', type=int, default=int(os.environ.get('MAX_MEETINGS') or 4),
-               help='--input ws: 동시에 여는 회의 수 상한 (.env MAX_MEETINGS). 다 차면 /ready 503, 새 회의는 1013으로 닫음. '
+               help='--input ws: 동시에 여는 회의 수 상한 (.env MAX_MEETINGS). 다 차면 새 회의는 1013으로 닫음 (/ready는 그대로 200). '
                     '기본 4는 임시값 (DEV 파드 측정 전, 개발자 맥 8코어에서 4회의 동시에 실시간 대비 0.07)')
 p.add_argument('--idle-release', type=float, default=float(os.environ.get('MEETING_IDLE_SEC') or 600),
                help='--input ws: 연결이 끊긴 회의를 이 초만큼 기다린 뒤 정리함 (.env MEETING_IDLE_SEC). end는 보내지 않음')
@@ -449,8 +450,10 @@ def health():
     ok = bool(PROC['running'])
     body = {'ok': ok, 'input': A.input, 'connected': bool(CONNS), 'connections': len(CONNS), 'draining': draining()}
     if WS_MODE:
-        with MLOCK: ms = sorted(MEETINGS)
-        body.update(meetings=ms, maxMeetings=A.max_meetings, full=len(ms) >= A.max_meetings)
+        with MLOCK: ms = sorted(MEETINGS); rs = [MEETINGS[k] for k in ms]
+        # backlog: 처리 스레드가 아직 못 넣은 소리(초). 계속 늘면 이 서버가 회의 수를 감당하지 못하는 것
+        body.update(meetings=ms, maxMeetings=A.max_meetings, full=len(ms) >= A.max_meetings,
+                    backlog={k: round(r.q.qsize() * 0.1, 1) for k, r in zip(ms, rs)})
         if ROOM_ERR['count']: body.update(roomErrors=ROOM_ERR['count'], lastRoomError=ROOM_ERR['last'])
     elif LOCAL:
         body.update(state=LOCAL.status['state'], meeting=LOCAL.sess and LOCAL.sess['meeting_id'], audioSec=LOCAL.status['audio_sec'])
@@ -461,15 +464,17 @@ def health():
 def ws_process_request(conn, request):
     """음성 포트로 오는 평범한 HTTP GET. 상태 확인만 받고, 나머지는 WebSocket 손잡기로 넘김.
     이 포트는 밖으로 열려 있어서(WS_HOST=0.0.0.0) 컨테이너 밖에서도 닿음. 개발 화면 포트는 닫아 둠
-    /ready: drain 중이거나 회의가 다 차면 503 → ALB가 새 연결을 다른 파드로 보냄 (이미 붙은 연결은 그대로)"""
+    /ready: drain 중이면 503 → ALB가 새 연결을 다른 파드로 보냄 (이미 붙은 연결은 그대로).
+    회의가 다 차도 503을 내지 않음: 파드가 하나면 ALB 대상에서 빠져 진행 중인 회의의 다시 연결까지 막힘.
+    새 회의는 ws_handler가 1013으로 거절함"""
     path = request.path.split('?')[0]
     if path not in ('/health', '/ready') and not draining(): return None
     from http import HTTPStatus
     from websockets.datastructures import Headers
     from websockets.http11 import Response
     code, body = health()
-    if path == '/ready' and (draining() or full()):
-        code, body = 503, json.dumps({'ready': False, 'draining': draining(), 'full': full()}).encode() + b'\n'
+    if path == '/ready' and draining():
+        code, body = 503, b'{"ready":false,"draining":true}\n'
     elif path not in ('/health', '/ready'):
         # Do not consume a one-use ticket on a retiring process.
         code, body = 503, b'{"error":"draining"}\n'

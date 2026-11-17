@@ -16,7 +16,7 @@ class RouteTest(unittest.TestCase):
         self.is_draining = False
         self.conn = object()
         self.ns = {'json': json, 'PROC': {'running': True, 'error': None}, 'A': SimpleNamespace(input='ws', max_meetings=2),
-                   'WS_MODE': True, 'LOCAL': None, 'MLOCK': threading.Lock(), 'MEETINGS': {'2': object()},
+                   'WS_MODE': True, 'LOCAL': None, 'MLOCK': threading.Lock(), 'MEETINGS': {'2': SimpleNamespace(q=SimpleNamespace(qsize=lambda: 0))},
                    'CONNS': {self.conn}, 'ROOM_ERR': {'count': 0, 'last': None}, 'draining': lambda: self.is_draining}
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), self.ns)
 
@@ -44,15 +44,13 @@ class RouteTest(unittest.TestCase):
         self.ns['PROC']['running'] = False
         self.assertEqual(self.request('/health').status_code, 503)
 
-    def test_full_meetings_make_not_ready_but_healthy(self):
-        self.ns['MEETINGS']['3'] = object()   # 상한 2에 닿음
-        self.assertEqual(self.request('/ready').status_code, 503)
-        self.assertEqual(json.loads(self.request('/ready').body)['full'], True)
-        self.assertEqual(self.request('/health').status_code, 200)
-        self.assertEqual(json.loads(self.request('/health').body)['meetings'], ['2', '3'])
-        self.assertIsNone(self.request('/ws/stt/meetings/4?ticket=test-only'))   # 거절(1013)은 손잡기 뒤 ws_handler에서
-        del self.ns['MEETINGS']['3']
+    def test_full_meetings_stay_ready(self):
+        # 파드가 하나일 때 /ready가 503이면 ALB 대상에서 빠져 진행 중인 회의도 다시 붙지 못함 → 다 차도 200
+        self.ns['MEETINGS']['3'] = SimpleNamespace(q=SimpleNamespace(qsize=lambda: 12))   # 상한 2에 닿음
         self.assertEqual(self.request('/ready').status_code, 200)
+        h = json.loads(self.request('/health').body)
+        self.assertEqual((h['meetings'], h['full'], h['backlog']['3']), (['2', '3'], True, 1.2))
+        self.assertIsNone(self.request('/ws/stt/meetings/4?ticket=test-only'))   # 거절(1013)은 손잡기 뒤 ws_handler에서
 
 
 if __name__ == '__main__':

@@ -121,8 +121,8 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 
 - 백엔드: `POST {backend-url}/internal/meetings/{meetingId}/transcripts`, 본문 `{"segments": [...]}`. 0.5초마다 바뀐 줄만 보내고, 실패하면 다음 주기에 다시 보냄. 필드 설명은 `app/backend_sender.py` 첫머리
 - 브라우저 → STT (WebSocket, `ws://localhost:8770`)
-  - 상태 확인: `GET /health` → `{"ok": true, "input": "ws", "connected": true, "connections": 2, "draining": false, "meetings": ["12", "13"], "maxMeetings": 4, "full": false}`. 입력 서버가 죽었으면 `503` (회의 하나의 오류는 그 회의만 닫고 `roomErrors`에 셈). **음성 포트와 개발 화면 포트 양쪽에 있음** — 운영에서는 개발 화면 포트를 닫으므로 바깥에서는 음성 포트로 확인
-  - 받을 준비: `GET /ready` → drain 중이거나 열린 회의가 `--max-meetings`(`.env MAX_MEETINGS`, 기본 4)에 닿으면 `503`. ALB가 새 연결을 다른 파드로 보내게 함 (이미 붙은 연결은 그대로)
+  - 상태 확인: `GET /health` → `{"ok": true, "input": "ws", "connected": true, "connections": 2, "draining": false, "meetings": ["12", "13"], "maxMeetings": 4, "full": false, "backlog": {"12": 0.0, "13": 0.1}}` (`backlog`: 회의별로 아직 처리하지 못한 소리(초). 계속 늘면 회의 수를 감당하지 못하는 것). 입력 서버가 죽었으면 `503` (회의 하나의 오류는 그 회의만 닫고 `roomErrors`에 셈). **음성 포트와 개발 화면 포트 양쪽에 있음** — 운영에서는 개발 화면 포트를 닫으므로 바깥에서는 음성 포트로 확인
+  - 받을 준비: `GET /ready` → drain 중이면 `503`. 회의가 다 차도 `200` (DEV는 파드가 하나라, 503이면 ALB 대상에서 빠져 진행 중인 회의의 다시 연결까지 막힘)
   - 연결 주소: `/ws/stt/meetings/{meetingId}?ticket=…` (Gateway를 거쳐도 경로가 그대로 옴)
   - 입장권 확인: 연결을 받으면 STT가 `POST {backend-url}/internal/stt-tickets/{ticket}/consume`을 한 번 부름. 401이거나 백엔드가 3초 안에 답하지 못하면 `1008`로 거절. 연결 주소·`start` 메시지·확인 응답의 `meetingId`가 **모두 같아야** 받아들임
     - 입장권은 30초 유효하고 한 번 쓰면 지워짐. 다시 연결할 때는 브라우저가 새로 받아 와야 함
@@ -135,7 +135,7 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
   - `meetingId`는 백엔드 회의 번호(숫자). 숫자가 아니면 연결을 끊음 (틀린 번호로 전사가 나가지 않게)
   - 여러 회의를 동시에 받음 (SCRUM-288). 모델은 한 번만 올리고 회의마다 상태를 따로 둠
     - 같은 `meetingId`로 새 연결이 오면 그 회의의 이전 연결만 닫고 이어받음 (서버가 끊김을 아직 모르는 사이에 다시 붙어도 막히지 않게). 자리를 내준 연결은 코드 `4001`로 닫히므로, 브라우저는 이 코드를 받으면 다시 붙지 않아야 함. 다른 회의의 연결은 건드리지 않음
-    - 열린 회의가 상한에 닿으면 새 회의 연결은 코드 `1013`(잠시 뒤 다시)으로 닫힘. 입장권 주소로 회의를 알 수 있으면 입장권을 쓰기 전에 닫음. 브라우저는 새 입장권으로 다시 연결해야 함
+    - 열린 회의가 상한(`--max-meetings`, `.env MAX_MEETINGS`, 기본 4)에 닿으면 새 회의 연결은 코드 `1013`(잠시 뒤 다시)으로 닫힘. 이미 열린 회의의 다시 연결은 받음. 입장권 주소로 회의를 알 수 있으면 입장권을 쓰기 전에 닫음. 브라우저는 새 입장권으로 다시 연결해야 함
     - 연결이 끊긴 채 `--idle-release`초(`.env MEETING_IDLE_SEC`, 기본 600)가 지나면 남은 줄을 보내고 `end` 없이 회의를 정리함. 그 뒤 붙으면 `offsetMs`로 이어 가고 `start` 알림이 다시 나감 (STT가 다시 켜졌을 때와 같음)
     - 개발 화면은 주소 뒤 `?m=회의번호`로 볼 회의를 고름 (없으면 가장 최근에 시작한 회의)
 - 백엔드로 보내는 것 (`app/backend_sender.py`)
