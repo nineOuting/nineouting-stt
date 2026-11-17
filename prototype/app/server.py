@@ -142,6 +142,7 @@ PROC = {'running': True, 'error': None}   # 프로세스 단위 상태. 입력 �
 ROOM_ERR = {'count': 0, 'last': None}     # 회의 하나의 처리 스레드가 죽은 횟수 (그 회의만 닫고 서버는 계속)
 stop = threading.Event()
 MS = SR * 2 // 1000   # 1ms = 32바이트
+FRESH_MS = 2000       # 이만큼 받은 회의에 offsetMs 0으로 다시 붙으면 새로 연 브라우저로 봄 (시작 직후 끊긴 정상 다시 연결과 구분)
 WS_MODE = A.input == 'ws' and not A.wav
 
 
@@ -578,9 +579,15 @@ def ws_handler(conn):
                 if old is not None and old is not conn:
                     log(f'{room.tag}WebSocket 새 연결이 이전 연결을 대신함')
                     threading.Thread(target=ws_close, args=(old, 4001, 'replaced by a new connection'), daemon=True).start()
-                if mid == room.meeting:                     # 같은 회의로 다시 연결
+                if mid == room.meeting and off == 0 and room.ms >= FRESH_MS:
+                    # 새로 연 브라우저(새로고침 등)는 0부터 셈. 겹침으로 보고 버리면 앞서 받은 길이만큼 새 말이 사라지므로,
+                    # 버리지 않고 받은 위치 뒤에 이어 붙임. 줄 시각은 서버가 계산하므로 틀어지지 않음
+                    # (회의가 이미 정리됐거나 STT가 다시 켜진 뒤의 새로고침은 여기서 막지 못함: 브라우저가 이어서 셀 위치를 보내야 함)
+                    log(f'{room.tag}offsetMs 0으로 다시 연결 (받은 소리 {room.ms / 1000:.1f}초): 새로 연 브라우저로 보고 이어 붙임')
+                    room.skip = 0
+                elif mid == room.meeting:                   # 같은 회의로 다시 연결
                     gap = off - room.ms
-                    if gap > 0:                              # 빈 시간은 무음으로 채워 시각을 맞춤
+                    if gap > 0:                            # 빈 시간은 무음으로 채워 시각을 맞춤
                         if gap > 10000: log(f'{room.tag}다시 연결: {gap / 1000:.1f}초가 비어 무음으로 채움')
                         z = bytes(int(gap) * MS)
                         for i in range(0, len(z), 3200): room.q.put(z[i:i + 3200])
