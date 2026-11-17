@@ -19,6 +19,10 @@
 - 다른 인식 결과: 보완 줄 전부와 확신도 0.3 미만 글자가 있는 메인 줄을 chunk-16(빔 탐색)·chunk-64(greedy)로
   다시 인식. 기본 결과와 다를 때만 알림. 별도 스레드에서 처리해 메인 전사를 막지 않음
 
+여러 회의: 모델은 Shared에 한 번만 올리고 회의마다 Engine(on_event, shared=…)를 만듦 (SCRUM-288).
+  인식기 하나에서 회의마다 스트림을 따로 만들어 각자의 스레드에서 디코딩함. 혼자 돌린 결과와 같음 (docs/notes.md 시험 기록)
+  shared 없이 Engine()을 부르면 전용 Shared를 만들어 지금까지와 같게 동작함
+
 소리를 feed()로 0.1초씩 넣으면 on_event(dict)가 호출됨 (alt는 작업 스레드에서 호출됨).
   {'type': 'partial',   'id', 'start', 'text'}                          말하는 중 (같은 id가 계속 갱신)
   {'type': 'final',     'id', 'start', 'end', 'text', 'conf', 'spk', 'spk_info', 'kind'}   발화 확정. conf는 text 글자별 확신도(0~1)
@@ -28,7 +32,7 @@
   kind: 'backchannel'(맞장구) / 'filler'(간투사) / None (line_kind 참고)
   {'type': 'alt',       'id', 'alts': [{'name', 'text'}, ...]}         같은 구간의 다른 인식 결과 (기본과 다른 것만)
 """
-import os, queue, re, threading, types
+import collections, os, queue, re, threading, types
 import numpy as np
 import sherpa_onnx
 
@@ -96,16 +100,21 @@ def line_kind(text):
     return 'backchannel' if any(w in BACKCHANNEL for w in words) else 'filler'
 
 
+def make_extractor(model):
+    if not os.path.exists(model):
+        raise FileNotFoundError(f'화자 모델 없음: {model}')
+    return sherpa_onnx.SpeakerEmbeddingExtractor(sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=model, num_threads=1))
+
+
 class Diarizer:
     """발화마다 TitaNet-small 임베딩을 뽑아 누적 화자 중심과 비교하는 온라인 화자 판별.
     방식과 설정은 nineouting-ref/stt_eval/poc/summary.md 4절 (pipe.py·stream_sim.py와 같은 방식).
     설정 E: 유사도 0.60 이상이면 그 화자, 미만이면 새 화자. 단 2초 미만 발화는 새 화자로 등록하지 않고 가장 가까운 화자에 배정.
     화자 번호는 1부터. 이름은 모름."""
 
-    def __init__(self, model, th=0.60, min_new=2.0, max_speakers=0):
-        if not os.path.exists(model):
-            raise FileNotFoundError(f'화자 모델 없음: {model}')
-        self.ex = sherpa_onnx.SpeakerEmbeddingExtractor(sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=model, num_threads=1))
+    def __init__(self, model, th=0.60, min_new=2.0, max_speakers=0, ex=None):
+        """ex: 다른 회의와 같이 쓰는 임베딩 추출기 (Shared.ex). 없으면 model로 새로 만듦. 화자 중심은 회의마다 따로"""
+        self.ex = ex or make_extractor(model)
         self.th, self.min_new, self.cents = th, min_new, []
         self.max = max_speakers          # 참석자 수 (0이면 자동). 다 차면 새 화자를 만들지 않음 (PoC 4.6절의 조건부 설정)
         self.merged = {}                 # 합쳐진 화자 번호 → 합친 대상 번호. 합친 번호는 다시 쓰지 않음
@@ -150,59 +159,90 @@ class Diarizer:
 
 
 class AltWorker:
-    """같은 구간을 다른 설정으로 다시 인식하는 작업 스레드. 메인 전사를 막지 않음."""
+    """같은 구간을 다른 설정으로 다시 인식하는 작업 스레드. 메인 전사를 막지 않음.
+    여러 회의가 하나를 같이 씀 (스레드 하나라 회의가 늘어도 이 작업이 쓰는 CPU는 코어 하나를 넘지 않음).
+    결과는 submit 때 받은 on_event로 보냄"""
 
-    def __init__(self, model_dir, on_event):
+    def __init__(self, model_dir, on_event=None):
         self.recs = [('chunk-16', make_rec(model_dir, '16', 'modified_beam_search')),
                      ('chunk-64 greedy', make_rec(model_dir, '64', 'greedy_search'))]
         self.on_event, self.q = on_event, queue.Queue()
+        self.cv, self.left = threading.Condition(), collections.Counter()   # 보낼 곳(on_event)별 남은 작업 수
         threading.Thread(target=self._run, daemon=True).start()
 
-    def submit(self, i, seg, main_text):
-        self.q.put((i, seg, main_text))
+    def submit(self, i, seg, main_text, on_event=None):
+        cb = on_event or self.on_event
+        with self.cv: self.left[id(cb)] += 1
+        self.q.put((i, seg, main_text, cb))
 
     def _run(self):
         while True:
-            i, seg, main = self.q.get()
+            i, seg, main, cb = self.q.get()
             try:
                 alts, seen = [], {squash(main)}
                 for name, rec in self.recs:
                     t = text_conf(decode(rec, seg))[0]
                     if t and re.search('[가-힣]', t) and squash(t) not in seen:
                         alts.append({'name': name, 'text': t}); seen.add(squash(t))
-                if alts: self.on_event({'type': 'alt', 'id': i, 'alts': alts})
+                if alts: cb({'type': 'alt', 'id': i, 'alts': alts})
             finally:
+                with self.cv:
+                    self.left[id(cb)] -= 1
+                    if self.left[id(cb)] <= 0: del self.left[id(cb)]
+                    self.cv.notify_all()
                 self.q.task_done()
 
-    def drain(self):
-        self.q.join()
+    def drain(self, on_event=None, timeout=None):
+        """on_event로 보낼 작업이 끝날 때까지 기다림 (없으면 모든 작업). 다른 회의 작업은 기다리지 않음"""
+        if on_event is None: self.q.join(); return
+        with self.cv: self.cv.wait_for(lambda: self.left[id(on_event)] <= 0, timeout)
+
+
+class Shared:
+    """여러 회의가 같이 쓰는 모델: 메인 인식기, 화자 임베딩 추출기, 다른 인식 결과 작업.
+    한 번만 올려 두고 회의마다 Engine(on_event, shared=…)로 상태만 새로 만듦.
+    인식기 하나에서 스트림을 여럿 만들어 스레드마다 하나씩 디코딩함 (스트림이 디코딩 상태를 들고 있음)
+    VAD는 상태가 모델 객체 안에 있어 회의마다 따로 만듦 (Engine)"""
+
+    def __init__(self, model_dir=None, vad_model=None, chunk=DEFAULTS['chunk'], hotwords=DEFAULTS['hotwords'],
+                 hotwords_score=DEFAULTS['hotwords_score'], spk_model=None, diar=True, alt=True, end_silence=0.8,
+                 max_len=DEFAULTS['max_len'], blank_penalty=DEFAULTS['blank_penalty']):
+        model_dir = model_dir or f'{DEFAULT_MODELS}/zipformer-174m'
+        self.vad_model = vad_model or f'{DEFAULT_MODELS}/speaker/silero_vad.onnx'
+        if not os.path.exists(self.vad_model):
+            raise FileNotFoundError(f'VAD 모델 없음: {self.vad_model}')
+        self.rec = make_rec(model_dir, chunk, 'modified_beam_search', endpoint=True, hotwords=hotwords, hotwords_score=hotwords_score,
+                            end_silence=end_silence, max_len=max_len, blank_penalty=blank_penalty)   # VAD 보완 다시 인식도 이 인식기를 씀
+        self.max_len, self.end_silence = max_len, end_silence   # 인식기 끊기 설정과 Engine의 강제 분할 판단이 같은 값을 써야 함
+        self.ex = make_extractor(spk_model or f'{DEFAULT_MODELS}/speaker/nemo_en_titanet_small.onnx') if diar else None
+        self.alt = AltWorker(model_dir) if alt else None
 
 
 class Engine:
     def __init__(self, on_event, model_dir=None, vad_model=None, chunk=DEFAULTS['chunk'], hotwords=DEFAULTS['hotwords'],
                  hotwords_score=DEFAULTS['hotwords_score'], wait=2.0, min_gap=0.5, recover=True, keep_seconds=120,
                  spk_model=None, diar=True, alt=True, max_speakers=0, end_silence=0.8, max_len=DEFAULTS['max_len'],
-                 overlap=DEFAULTS['overlap'], blank_penalty=DEFAULTS['blank_penalty']):
-        model_dir = model_dir or f'{DEFAULT_MODELS}/zipformer-174m'
-        vad_model = vad_model or f'{DEFAULT_MODELS}/speaker/silero_vad.onnx'
-        if not os.path.exists(vad_model):
-            raise FileNotFoundError(f'VAD 모델 없음: {vad_model}')
-        self.rec = make_rec(model_dir, chunk, 'modified_beam_search', endpoint=True, hotwords=hotwords, hotwords_score=hotwords_score,
-                            end_silence=end_silence, max_len=max_len, blank_penalty=blank_penalty)   # VAD 보완 다시 인식도 이 인식기를 씀
-        self.max_len, self.overlap, self.end_silence = max_len, overlap, end_silence
+                 overlap=DEFAULTS['overlap'], blank_penalty=DEFAULTS['blank_penalty'], shared=None):
+        """shared: 다른 회의와 같이 쓰는 모델 (Shared). 없으면 이 엔진 전용으로 만듦 (지금까지와 같은 결과).
+        shared를 주면 모델·인식 설정(model_dir, chunk, hotwords*, spk_model, diar, alt, end_silence, max_len, blank_penalty)은 shared 것을 씀"""
+        if shared is None:
+            shared = Shared(model_dir, vad_model, chunk, hotwords, hotwords_score, spk_model, diar, alt, end_silence, max_len, blank_penalty)
+        self.shared = shared
+        self.rec = shared.rec
+        self.max_len, self.overlap, self.end_silence = shared.max_len, overlap, shared.end_silence
         self.shift = 0.0     # 인식기 시각 - 실제 시각 (강제 분할 때 소리를 다시 넣은 만큼 앞섬)
         self.seg_len = 0.0   # 지금 줄을 시작한 뒤 인식기에 넣은 소리 길이 (강제 분할 판단용)
         self.dedup = None    # 강제 분할 직후: {'t': 앞 줄 마지막 글자 실제 시각, 'cut': 끊은 시각, 'tail': 앞 줄 끝 글자}
-        self.diar = Diarizer(spk_model or f'{DEFAULT_MODELS}/speaker/nemo_en_titanet_small.onnx',
-                             max_speakers=max_speakers) if diar else None
-        self.alt = AltWorker(model_dir, on_event) if alt else None
+        self.diar = Diarizer(None, max_speakers=max_speakers, ex=shared.ex) if shared.ex else None
+        self.alt = shared.alt
         cfg = sherpa_onnx.VadModelConfig()
-        cfg.silero_vad.model = vad_model; cfg.silero_vad.threshold = 0.5
+        cfg.silero_vad.model = shared.vad_model; cfg.silero_vad.threshold = 0.5
         cfg.silero_vad.min_silence_duration = 0.25; cfg.silero_vad.min_speech_duration = 0.25
         cfg.silero_vad.max_speech_duration = 120; cfg.sample_rate = SR; cfg.num_threads = 1
         self.vad = sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=60)
         self.win = cfg.silero_vad.window_size
         self.on_event, self.wait, self.min_gap, self.recover_on = on_event, wait, min_gap, recover
+        self.alt_event = on_event   # 다른 인식 결과는 처음 받은 on_event로 보냄 (서버가 on_event를 시간 재기용으로 감싸도 그대로)
         self.keep = keep_seconds
         self.s = self.rec.create_stream()
         self.fed = 0.0; self.buf = np.zeros(0, np.float32); self.buf_t0 = 0.0  # 최근 소리 (메모리에만)
@@ -297,7 +337,7 @@ class Engine:
         self.on_event({'type': 'final', 'id': i, 'start': round(cur[0], 2), 'end': round(end, 2),
                        'text': text, 'conf': conf, 'spk': spk, 'spk_info': spk_info, 'kind': line_kind(text)})
         if self.alt and any(c < LOW_CONF for c in conf):
-            self.alt.submit(i, self._audio(cur[0] - 0.2, end + 0.2), text)
+            self.alt.submit(i, self._audio(cur[0] - 0.2, end + 0.2), text, self.alt_event)
 
     def _recover(self, vs, ve, cur):
         cov = sorted(self.cover + ([cur] if cur else []))
@@ -317,7 +357,7 @@ class Engine:
                 i = self._new_id(); spk, spk_info = self._speaker(g0 - 0.2, g1 + 0.2)
                 self.on_event({'type': 'recovered', 'id': i, 'start': round(g0, 2), 'end': round(g1, 2),
                                'text': text, 'conf': conf, 'spk': spk, 'spk_info': spk_info, 'kind': line_kind(text)})
-                if self.alt: self.alt.submit(i, seg, text)
+                if self.alt: self.alt.submit(i, seg, text, self.alt_event)
 
     def finish(self):
         s, rec = self.s, self.rec
@@ -326,4 +366,4 @@ class Engine:
         r = self._trim(rec.get_result_all(s)); cur = self._span(r)
         if r.text.strip() and cur: self._final(cur, r)
         elif self.cur_id is not None: self.on_event({'type': 'drop', 'id': self.cur_id})
-        if self.alt: self.alt.drain()
+        if self.alt: self.alt.drain(self.alt_event)

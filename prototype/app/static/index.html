@@ -328,9 +328,12 @@ function options(d) {
   return out;
 }
 
+// 여러 회의를 받을 때(--input ws) 볼 회의: 주소 뒤 ?m=회의번호. 없으면 서버가 가장 최근에 시작한 회의를 보여 줌
+const Q = location.search;
+
 async function sendEdit(id, text, source) {
   try {
-    const r = await fetch('/edit', { method: 'POST', headers: { 'X-Meetingnote': 'edit', 'Content-Type': 'application/json' },
+    const r = await fetch('/edit' + Q, { method: 'POST', headers: { 'X-Meetingnote': 'edit', 'Content-Type': 'application/json' },
                                      body: JSON.stringify({ id, text, source }) });
     if (!r.ok) alert(`고치지 못했습니다 (응답 ${r.status}). 서버를 최신 코드로 다시 실행했는지 확인해 주세요.`);
   } catch (e) { alert('서버에 연결하지 못했습니다.'); }
@@ -632,7 +635,7 @@ function handleSend(ev) {
 document.getElementById('clearBtn').onclick = async () => {
   if (!confirm('지금까지의 전사문을 모두 지울까요?\n\n· 되돌릴 수 없습니다\n· 같은 주소를 연 다른 화면도 비워집니다\n· 자동 저장 파일에도 지운 뒤의 내용만 남습니다\n· 인식은 계속되며, 지금부터 하는 말이 다시 쌓입니다')) return;
   try {
-    const r = await fetch('/clear', { method: 'POST', headers: { 'X-Meetingnote': 'clear' } });
+    const r = await fetch('/clear' + Q, { method: 'POST', headers: { 'X-Meetingnote': 'clear' } });
     if (!r.ok) alert(`지우지 못했습니다 (응답 ${r.status}). 서버를 최신 코드로 다시 실행했는지 확인해 주세요.`);
   } catch (e) { alert('서버에 연결하지 못했습니다.'); }
 };
@@ -682,7 +685,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMerge()
 
 async function postJSON(path, body) {
   try {
-    const r = await fetch(path, { method: 'POST', headers: { 'X-Meetingnote': path.slice(1), 'Content-Type': 'application/json' },
+    const r = await fetch(path + Q, { method: 'POST', headers: { 'X-Meetingnote': path.slice(1), 'Content-Type': 'application/json' },
                                   body: JSON.stringify(body) });
     if (!r.ok) alert(`처리하지 못했습니다 (응답 ${r.status}). 서버를 최신 코드로 다시 실행했는지 확인해 주세요.`);
   } catch (e) { alert('서버에 연결하지 못했습니다.'); }
@@ -730,7 +733,7 @@ function showStatus(st) {
   meta.textContent = st.error ? `오류: ${st.error}` : `${source}${t}${st.running === false ? ' · 종료됨' : ''}`;
 }
 
-const es = new EventSource('/events');
+const es = new EventSource('/events' + Q);
 es.addEventListener('hello', e => showStatus(JSON.parse(e.data)));
 es.addEventListener('tick', e => showStatus(JSON.parse(e.data)));
 es.onmessage = e => { const ev = JSON.parse(e.data);
