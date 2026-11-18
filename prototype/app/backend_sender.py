@@ -109,6 +109,7 @@ class BackendSender:
         self.history = collections.deque(maxlen=200)   # 상태창용 최근 전송 기록
         self.stats = {'sent': 0, 'failed': 0, 'requests': 0, 'events': 0}
         self.conn = None
+        self.stopped = threading.Event()   # 회의가 끝나 Room을 정리할 때 주기 스레드를 멈춤 (stop)
         if self.url:
             u = urllib.parse.urlsplit(self.url)
             self.scheme, self.host, self.base = u.scheme, u.netloc, u.path
@@ -313,9 +314,15 @@ class BackendSender:
         if self.stats['failed'] in (1, 10, 100, 1000): self.log(f'백엔드로 보내지 못함 ({self.stats["failed"]}번째): {err}')
         return False, err
 
+    def stop(self):
+        """주기 스레드를 멈추고 연결을 닫음. 남은 줄·알림은 먼저 event('end')나 drain()으로 보내 둘 것"""
+        self.stopped.set()
+        with self.sending:
+            if self.conn is not None: self.conn.close(); self.conn = None
+
     def _loop(self):
         nxt = time.monotonic()
-        while True:
+        while not self.stopped.is_set():
             nxt += self.period
             time.sleep(max(0.0, nxt - time.monotonic()))
             if time.monotonic() - nxt > self.period: nxt = time.monotonic()   # 보내기가 오래 걸리면 밀린 주기는 건너뜀
