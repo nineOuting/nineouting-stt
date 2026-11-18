@@ -8,7 +8,7 @@ import unittest
 
 source = Path(__file__).parents[1] / 'app/server.py'
 tree = ast.parse(source.read_text())
-functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ('health', 'ws_process_request', 'full')]
+functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ('health', 'ws_process_request', 'full', 'at_cap')]
 
 
 class RouteTest(unittest.TestCase):
@@ -51,6 +51,14 @@ class RouteTest(unittest.TestCase):
         h = json.loads(self.request('/health').body)
         self.assertEqual((h['meetings'], h['full'], h['backlog']['3']), (['2', '3'], True, 1.2))
         self.assertIsNone(self.request('/ws/stt/meetings/4?ticket=test-only'))   # 거절(1013)은 손잡기 뒤 ws_handler에서
+
+    def test_zero_cap_means_no_limit(self):
+        # MAX_MEETINGS=0: 상한 없음 (0을 넣었다고 모든 회의가 거절되면 안 됨)
+        self.ns['A'].max_meetings = 0
+        self.ns['MEETINGS']['3'] = SimpleNamespace(q=SimpleNamespace(qsize=lambda: 0))
+        self.assertFalse(self.ns['full']())
+        h = json.loads(self.request('/health').body)
+        self.assertEqual((h['maxMeetings'], h['full']), (0, False))
 
 
 if __name__ == '__main__':

@@ -87,7 +87,10 @@ p.add_argument('--backend-period', type=float, default=0.5, help='백엔드 전�
 p.add_argument('--meeting-id', default='', help='첫 회의의 회의 번호 (백엔드가 쓰는 숫자). 없으면 자동 이름을 붙이고 백엔드로는 보내지 않음')
 p.add_argument('--max-meetings', type=int, default=int(os.environ.get('MAX_MEETINGS') or 4),
                help='--input ws: 동시에 여는 회의 수 상한 (.env MAX_MEETINGS). 다 차면 새 회의는 1013으로 닫음 (/ready는 그대로 200). '
-                    '기본 4는 임시값 (DEV 파드 측정 전, 개발자 맥 8코어에서 4회의 동시에 실시간 대비 0.07)')
+                    '0이면 상한 없음 (시험용: CPU가 모자라면 모든 회의의 자막이 같이 늦어짐). '
+                    '기본 4: DEV 파드의 보장 CPU 0.5코어로 버티는 수 (회의당 약 0.1코어, 2026-11-18 DEV 측정)')
+p.add_argument('--backlog-warn', type=float, default=float(os.environ.get('BACKLOG_WARN_SEC') or 5),
+               help='--input ws: 회의의 밀린 소리가 이 초를 넘으면 로그에 남김 (.env BACKLOG_WARN_SEC, 0이면 끔). 1초 밑으로 내려오면 풀림도 남김')
 p.add_argument('--idle-release', type=float, default=float(os.environ.get('MEETING_IDLE_SEC') or 600),
                help='--input ws: 연결이 끊긴 회의를 이 초만큼 기다린 뒤 정리함 (.env MEETING_IDLE_SEC). end는 보내지 않음')
 p.add_argument('--no-ticket', action='store_true',
@@ -150,9 +153,14 @@ def log(m):
     print(m, file=sys.stderr, flush=True)
 
 
+def at_cap(n):
+    """열린 회의 n개가 상한에 닿았는지. 상한 0은 상한 없음"""
+    return A.max_meetings > 0 and n >= A.max_meetings
+
+
 def full():
     """--input ws: 열린 회의가 상한에 닿음"""
-    with MLOCK: return WS_MODE and len(MEETINGS) >= A.max_meetings
+    with MLOCK: return WS_MODE and at_cap(len(MEETINGS))
 
 
 class Room:
@@ -168,6 +176,7 @@ class Room:
         self.engine = None
         self.manual_seq = 0      # 직접 추가한 줄 번호
         self.clear_at = -1.0     # 마지막으로 지운 오디오 시각. 이보다 앞에서 시작한 보완 줄은 나중에 도착해도 버림
+        self.backlog_warned = False   # 밀림 로그를 남긴 뒤 아직 풀리지 않음
         self.clear_id = 0        # 지울 때의 엔진 줄 번호. 이 번호 이하의 말하던·확정 줄은 지우기 전 줄이라 버림
         # (인식기는 글자로 안 바꾼 소리를 약 1.2초 들고 있어서, 지운 뒤 새 줄의 시작 시각이 지운 시각보다 조금 앞설 수 있음 → 시각으로 거르면 지운 뒤 말까지 버려짐)
         self.sess = None         # 지금 세션: file, wav_path, wav(쓰는 중인 wave 객체), wav_t0, t0, started, complete
@@ -454,7 +463,7 @@ def health():
     if WS_MODE:
         with MLOCK: ms = sorted(MEETINGS); rs = [MEETINGS[k] for k in ms]
         # backlog: 처리 스레드가 아직 못 넣은 소리(초). 계속 늘면 이 서버가 회의 수를 감당하지 못하는 것
-        body.update(meetings=ms, maxMeetings=A.max_meetings, full=len(ms) >= A.max_meetings,
+        body.update(meetings=ms, maxMeetings=A.max_meetings, full=at_cap(len(ms)),
                     backlog={k: round(r.q.qsize() * 0.1, 1) for k, r in zip(ms, rs)})
         if ROOM_ERR['count']: body.update(roomErrors=ROOM_ERR['count'], lastRoomError=ROOM_ERR['last'])
     elif LOCAL:
@@ -565,7 +574,7 @@ def ws_handler(conn):
                 with MLOCK:
                     r = MEETINGS.get(mid)
                     if r is None:
-                        if len(MEETINGS) >= A.max_meetings: r = False
+                        if at_cap(len(MEETINGS)): r = False
                         else:
                             r = MEETINGS[mid] = Room(mid, f'WebSocket ws://{A.ws_host}:{A.ws_port}'); LIVE.add(r)
                             r.thread = threading.Thread(target=r.ws_main, daemon=True); r.thread.start()
@@ -624,13 +633,24 @@ def ws_handler(conn):
 
 
 def reaper():
-    """연결 없이 --idle-release초가 지난 회의를 정리함 (자리를 바로 비우고, 처리 스레드가 남은 줄을 보냄)"""
+    """5초마다: 연결 없이 --idle-release초가 지난 회의를 정리함 (자리를 바로 비우고, 처리 스레드가 남은 줄을 보냄).
+    회의의 밀린 소리가 --backlog-warn초를 넘거나 다시 1초 밑으로 내려오면 로그에 남김 (몇 개부터 밀리는지 로그로 보기 위함)"""
     while not stop.wait(5.0):
         now = time.monotonic()
         with MLOCK:
             for k, r in list(MEETINGS.items()):
                 if r.conn is None and r.gone_at is not None and now - r.gone_at >= A.idle_release:
                     del MEETINGS[k]; r.q.put('release')
+            rooms, n = list(MEETINGS.values()), len(MEETINGS)
+        if A.backlog_warn <= 0: continue
+        for r in rooms:
+            b = r.q.qsize() * 0.1
+            if not r.backlog_warned and b >= A.backlog_warn:
+                r.backlog_warned = True
+                log(f'{r.tag}밀림: 처리하지 못한 소리 {b:.1f}초 (열린 회의 {n}개). CPU가 회의 수를 따라가지 못함')
+            elif r.backlog_warned and b < 1.0:
+                r.backlog_warned = False
+                log(f'{r.tag}밀림 풀림: 처리하지 못한 소리 {b:.1f}초 (열린 회의 {n}개)')
 
 
 # ---- 마이크·wav 입력 ----
@@ -894,7 +914,7 @@ def main():
         threading.Thread(target=serve_ws, daemon=True).start()
         threading.Thread(target=reaper, daemon=True).start()
         source = f'WebSocket ws://{A.ws_host}:{A.ws_port}'
-        log(f'WebSocket 입력 대기: {source}  동시 회의 최대 {A.max_meetings}개  시험용 보내는 화면: http://localhost:{A.port}/sender')
+        log(f'WebSocket 입력 대기: {source}  동시 회의 {f"최대 {A.max_meetings}개" if A.max_meetings > 0 else "상한 없음"}  시험용 보내는 화면: http://localhost:{A.port}/sender')
     else:
         source = A.wav or f'마이크 {A.device or "기본"} ({A.input})'
         LOCAL = Room('local', source); remember(LOCAL)
