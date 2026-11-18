@@ -5,8 +5,11 @@
 # 층 순서는 "잘 안 바뀌는 것부터". 코드만 고치면 모델 160MB를 다시 받지 않음
 FROM python:3.12-slim
 
+# MALLOC_ARENA_MAX=2: 회의마다 스레드가 생겼다 사라져 glibc 메모리 구역(arena)이 늘고, 회의가 끝나도 메모리가 계속 쌓임.
+#   구역을 2개로 묶으면 쌓이지 않고 처리 시간도 같음 (docs/notes.md 2026-11-18 측정)
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    MALLOC_ARENA_MAX=2
 
 WORKDIR /app
 
