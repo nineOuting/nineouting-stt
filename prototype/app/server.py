@@ -178,6 +178,7 @@ class Room:
         self.meeting = None      # --input ws: start를 받은 meetingId
         self.ms = 0.0            # 그 회의에서 받은 소리(ms)
         self.skip = 0            # 다시 연결 뒤 겹쳐서 버릴 바이트
+        self.shift = 0.0         # 서버 시계 - 브라우저 시계(ms). 새로 연 브라우저가 0부터 다시 셀 때 생김
         self.gone_at = None      # 연결이 끊긴 시각 (monotonic). 붙어 있으면 None
         self.finished = False    # 처리 스레드가 빠져나갈 때 (end·정리)
         self.thread = None
@@ -579,14 +580,15 @@ def ws_handler(conn):
                 if old is not None and old is not conn:
                     log(f'{room.tag}WebSocket 새 연결이 이전 연결을 대신함')
                     threading.Thread(target=ws_close, args=(old, 4001, 'replaced by a new connection'), daemon=True).start()
-                if mid == room.meeting and off == 0 and room.ms >= FRESH_MS:
+                if mid == room.meeting and off == 0 and room.ms - room.shift >= FRESH_MS:
                     # 새로 연 브라우저(새로고침 등)는 0부터 셈. 겹침으로 보고 버리면 앞서 받은 길이만큼 새 말이 사라지므로,
                     # 버리지 않고 받은 위치 뒤에 이어 붙임. 줄 시각은 서버가 계산하므로 틀어지지 않음
+                    # 이때부터 브라우저 시계가 서버보다 room.ms만큼 늦으므로 그 차이(shift)를 기억해, 뒤의 다시 연결에서 offsetMs에 더함
                     # (회의가 이미 정리됐거나 STT가 다시 켜진 뒤의 새로고침은 여기서 막지 못함: 브라우저가 이어서 셀 위치를 보내야 함)
                     log(f'{room.tag}offsetMs 0으로 다시 연결 (받은 소리 {room.ms / 1000:.1f}초): 새로 연 브라우저로 보고 이어 붙임')
-                    room.skip = 0
+                    room.skip = 0; room.shift = room.ms
                 elif mid == room.meeting:                   # 같은 회의로 다시 연결
-                    gap = off - room.ms
+                    gap = off + room.shift - room.ms         # 브라우저 시계를 서버 시계로 바꿔 비교
                     if gap > 0:                            # 빈 시간은 무음으로 채워 시각을 맞춤
                         if gap > 10000: log(f'{room.tag}다시 연결: {gap / 1000:.1f}초가 비어 무음으로 채움')
                         z = bytes(int(gap) * MS)
@@ -594,9 +596,9 @@ def ws_handler(conn):
                         room.ms += int(gap)
                     elif gap < 0: room.skip = int(-gap) * MS
                 else:
-                    room.meeting, room.ms, room.skip = mid, off, 0
+                    room.meeting, room.ms, room.skip, room.shift = mid, off, 0, 0.0
                     room.q.put(('start', mid, off / 1000))
-                say(type='ready', meetingId=mid, meetingMs=round(room.ms))
+                say(type='ready', meetingId=mid, meetingMs=round(room.ms - room.shift))   # 브라우저 시계 기준
             elif t in ('pause', 'resume'):
                 if room is not None: room.q.put(t)
             elif t == 'end':
