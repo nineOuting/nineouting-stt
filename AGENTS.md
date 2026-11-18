@@ -4,7 +4,7 @@
 
 ## 구조
 - prototype/app/: STT 서버. engine.py(인식 엔진), server.py(입력·화면 서버), backend_sender.py(백엔드 전송), summary_sender.py(요약 쪽 전송, 이전 설계), envfile.py(.env 읽기), static/index.html(개발 화면)
-- prototype/tools/: download_models.py(모델 받기), mock_backend.py(가짜 백엔드), mic_sender.html(시험용 보내는 화면)
+- prototype/tools/: download_models.py(모델 받기), mock_backend.py(가짜 백엔드), mic_sender.html(시험용 보내는 화면), capacity_probe.py(동시 회의 처리 용량 측정, 파드 안에서도 돌림)
 - prototype/docs/notes.md: 설정 근거와 시험 기록
 - 설치·모델 받기·실행 순서는 prototype/README.md "빠른 시작" (윈도우·맥). 맥: .venv/bin/python, 윈도우: .venv\Scripts\python
 - 주소·포트는 prototype/.env (.env.example 복사, 깃 제외). 명령 옵션 > 환경 변수 > .env > 기본값
