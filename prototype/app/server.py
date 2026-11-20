@@ -34,6 +34,7 @@ http://localhost:8765 에서 열림. 녹음은 화면의 "녹음 시작"을 눌�
   접속 포트는 하나. 연결마다 받는 스레드가 meetingId에 맞는 Room 대기열에 소리를 넣고, Room의 처리 스레드가 인식함
   동시에 여는 회의는 --max-meetings개까지. 다 차면 새 회의 연결은 1013으로 닫음
   /ready는 다 차도 200으로 둠: DEV는 파드가 하나라 /ready가 503이 되면 ALB 대상에서 빠져, 진행 중인 회의의 다시 연결까지 막힘
+  파드가 여러 대이고 ALB 쿠키 고정을 쓰면 --ready-when-full로 꽉 차거나 밀릴 때 /ready 503 (SCRUM-337, ready.py)
   연결 없이 --idle-release초가 지난 회의는 남은 줄을 보내고 end 없이 정리함 (나중에 붙으면 offsetMs로 이어 감)
   개발 화면은 주소 뒤 ?m=회의번호로 회의를 고름 (없으면 가장 최근에 시작한 회의)
   마이크·wav 입력은 지금처럼 Room 하나
@@ -53,6 +54,7 @@ ENV_LOADED = load_env()   # engine의 모델 폴더 기본값(NINEOUTING_STT_MOD
 from engine import Engine, Shared, SR, DEFAULT_MODELS, DEFAULTS, line_kind  # noqa: E402
 from backend_sender import BackendSender, consume_ticket  # noqa: E402
 from drain import draining  # noqa: E402
+import ready as readiness  # noqa: E402  (SCRUM-337: 꽉 차거나 밀리면 새 회의를 받지 않음)
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 p = argparse.ArgumentParser()
@@ -98,6 +100,14 @@ p.add_argument('--replace-max', type=int, default=int(os.environ.get('REPLACE_MA
                     '(.env REPLACE_MAX, 0이면 끔). 같은 회의를 연 브라우저 둘이 서로 밀어내기를 반복하지 않게 함. 기본 5는 추정값')
 p.add_argument('--replace-window', type=float, default=float(os.environ.get('REPLACE_WINDOW_SEC') or 60),
                help='--input ws: --replace-max를 세는 시간(초) (.env REPLACE_WINDOW_SEC)')
+p.add_argument('--ready-when-full', action='store_true',
+               default=os.environ.get('READY_WHEN_FULL', '').strip().lower() in ('1', 'true', 'yes', 'on'),
+               help='--input ws: 꽉 차거나 밀리면 /ready를 503으로 내서 ALB가 새 연결을 다른 파드로 보내게 함 (.env READY_WHEN_FULL, 기본 꺼짐). '
+                    '파드가 2대 이상이고 ALB 쿠키 고정을 쓸 때 켬. 파드가 1대일 때 켜면 진행 중인 회의의 다시 연결까지 막힘 (SCRUM-337)')
+p.add_argument('--ready-backlog', type=float, default=float(os.environ.get('READY_BACKLOG_SEC') or 5),
+               help='--ready-when-full: 어느 회의든 밀린 소리가 이 초를 넘고 실시간보다 느리게 처리하면 밀림으로 봄 (.env READY_BACKLOG_SEC). 기본 5는 추정값')
+p.add_argument('--ready-margin', type=int, default=int(os.environ.get('READY_MARGIN') or 1),
+               help='--ready-when-full: 꽉 찬 뒤 이만큼 자리가 비어야 다시 받음 (.env READY_MARGIN). 오락가락이 심하면 늘림')
 p.add_argument('--no-ticket', action='store_true',
                help='--input ws: 음성 연결 입장권을 확인하지 않음 (백엔드 없이 /sender로 시험할 때). '
                     '--backend-url이 없으면 어차피 확인하지 않음')
@@ -148,6 +158,8 @@ RECENT = collections.OrderedDict()   # 개발 화면용 최근 Room (끝난 것 
 CONNS = set()          # 지금 붙어 있는 WebSocket 연결 전부 (start 전 포함). drain이 이 수가 0이 되길 기다림
 PROC = {'running': True, 'error': None}   # 프로세스 단위 상태. 입력 서버·로컬 입력 스레드가 죽으면 False → /health 503
 ROOM_ERR = {'count': 0, 'last': None}     # 회의 하나의 처리 스레드가 죽은 횟수 (그 회의만 닫고 서버는 계속)
+READY = {'busy': False, 'reason': ''}       # --ready-when-full: 새 회의를 받지 않는 중인지와 이유 (정리 스레드가 5초마다 정함)
+RESUMED = [0]                             # 이 프로세스가 처음 여는데 offsetMs가 0이 아닌 회의 수 (다른 파드에서 옮겨 왔거나 STT가 다시 켜진 뒤)
 stop = threading.Event()
 MS = SR * 2 // 1000   # 1ms = 32바이트
 FRESH_MS = 2000       # 이만큼 받은 회의에 offsetMs 0으로 다시 붙으면 새로 연 브라우저로 봄 (시작 직후 끊긴 정상 다시 연결과 구분)
@@ -182,6 +194,7 @@ class Room:
         self.manual_seq = 0      # 직접 추가한 줄 번호
         self.clear_at = -1.0     # 마지막으로 지운 오디오 시각. 이보다 앞에서 시작한 보완 줄은 나중에 도착해도 버림
         self.backlog_warned = False   # 밀림 로그를 남긴 뒤 아직 풀리지 않음
+        self.ready_prev = None        # --ready-when-full: 지난 판단 때의 (엔진에 넣은 소리 초, 시각). 실시간보다 느린지 보려고
         self.clear_id = 0        # 지울 때의 엔진 줄 번호. 이 번호 이하의 말하던·확정 줄은 지우기 전 줄이라 버림
         # (인식기는 글자로 안 바꾼 소리를 약 1.2초 들고 있어서, 지운 뒤 새 줄의 시작 시각이 지운 시각보다 조금 앞설 수 있음 → 시각으로 거르면 지운 뒤 말까지 버려짐)
         self.sess = None         # 지금 세션: file, wav_path, wav(쓰는 중인 wave 객체), wav_t0, t0, started, complete
@@ -477,7 +490,10 @@ def health():
         with MLOCK: ms = sorted(MEETINGS); rs = [MEETINGS[k] for k in ms]
         # backlog: 처리 스레드가 아직 못 넣은 소리(초). 계속 늘면 이 서버가 회의 수를 감당하지 못하는 것
         body.update(meetings=ms, maxMeetings=A.max_meetings, full=at_cap(len(ms)),
-                    backlog={k: round(r.q.qsize() * 0.1, 1) for k, r in zip(ms, rs)})
+                    backlog={k: round(r.q.qsize() * 0.1, 1) for k, r in zip(ms, rs)}, resumed=RESUMED[0])
+        if A.ready_when_full:   # 새 회의를 받는지 (/ready와 같은 판단). 꺼져 있으면 /ready는 drain만 봄
+            body['ready'] = not draining() and not READY['busy']
+            if READY['busy']: body['busyReason'] = READY['reason']
         if ROOM_ERR['count']: body.update(roomErrors=ROOM_ERR['count'], lastRoomError=ROOM_ERR['last'])
     elif LOCAL:
         body.update(state=LOCAL.status['state'], meeting=LOCAL.sess and LOCAL.sess['meeting_id'], audioSec=LOCAL.status['audio_sec'])
@@ -489,7 +505,8 @@ def ws_process_request(conn, request):
     """음성 포트로 오는 평범한 HTTP GET. 상태 확인만 받고, 나머지는 WebSocket 손잡기로 넘김.
     이 포트는 밖으로 열려 있어서(WS_HOST=0.0.0.0) 컨테이너 밖에서도 닿음. 개발 화면 포트는 닫아 둠
     /ready: drain 중이면 503 → ALB가 새 연결을 다른 파드로 보냄 (이미 붙은 연결은 그대로).
-    회의가 다 차도 503을 내지 않음: 파드가 하나면 ALB 대상에서 빠져 진행 중인 회의의 다시 연결까지 막힘.
+    --ready-when-full을 켜면 꽉 찼거나 밀릴 때도 503 (SCRUM-337, 판단은 정리 스레드가 하고 여기서는 읽기만 함).
+    끄면(기본) 회의가 다 차도 503을 내지 않음: 파드가 하나면 ALB 대상에서 빠져 진행 중인 회의의 다시 연결까지 막힘.
     새 회의는 ws_handler가 1013으로 거절함"""
     path = request.path.split('?')[0]
     if path not in ('/health', '/ready') and not draining(): return None
@@ -499,6 +516,8 @@ def ws_process_request(conn, request):
     code, body = health()
     if path == '/ready' and draining():
         code, body = 503, b'{"ready":false,"draining":true}\n'
+    elif path == '/ready' and A.ready_when_full and READY['busy']:   # 꽉 찼거나 밀림 (정리 스레드가 정해 둔 값만 읽음)
+        code, body = 503, json.dumps({'ready': False, 'reason': READY['reason']}, ensure_ascii=False).encode() + b'\n'
     elif path not in ('/health', '/ready'):
         # Do not consume a one-use ticket on a retiring process.
         code, body = 503, b'{"error":"draining"}\n'
@@ -600,6 +619,7 @@ def ws_handler(conn):
                             r.thread = threading.Thread(target=r.ws_main, daemon=True); r.thread.start()
                 if r is False: reject_full(conn, say, mid); return
                 remember(r)
+                resumed = False
                 with r.clock:   # 주인 바꾸기부터 ms·skip 계산까지 한 번에 (밀려난 연결의 받는 스레드가 사이에 끼지 못하게)
                     old, rejected = r.conn, False
                     if old is not None and old is not conn:
@@ -628,6 +648,7 @@ def ws_handler(conn):
                             elif gap < 0: r.skip = int(-gap) * MS
                         else:
                             fresh = None; gap = 0
+                            resumed = off > 0   # 처음 여는데 이미 진행 중인 회의 (SCRUM-337: 스티키 세션이 잘 먹히는지 보려고 셈)
                             r.meeting, r.ms, r.skip, r.shift = mid, off, 0, 0.0
                             r.q.put(('start', mid, off / 1000))
                         ready_ms = round(r.ms - r.shift)   # 브라우저 시계 기준
@@ -647,6 +668,9 @@ def ws_handler(conn):
                 if fresh is not None:
                     log(f'{room.tag}offsetMs 0으로 다시 연결 (받은 소리 {fresh / 1000:.1f}초): 새로 연 브라우저로 보고 이어 붙임')
                 elif gap > 10000: log(f'{room.tag}다시 연결: {gap / 1000:.1f}초가 비어 무음으로 채움')
+                if resumed:
+                    with MLOCK: RESUMED[0] += 1
+                    log(f'{room.tag}이어 온 회의: offsetMs {off / 1000:.1f}초 (다른 파드에서 옮겨 왔거나 STT가 다시 켜진 뒤로 보임)')
                 say(type='ready', meetingId=mid, meetingMs=ready_ms)
             elif t in ('pause', 'resume'):
                 if room is not None: room.q.put(t)
@@ -678,13 +702,40 @@ def reaper():
     """5초마다: 연결 없이 --idle-release초가 지난 회의를 정리함 (자리를 바로 비우고, 처리 스레드가 남은 줄을 보냄).
     회의의 밀린 소리가 --backlog-warn초를 넘거나 다시 1초 밑으로 내려오면 로그에 남김 (몇 개부터 밀리는지 로그로 보기 위함)"""
     while not stop.wait(5.0):
-        now = time.monotonic()
-        with MLOCK:
-            for k, r in list(MEETINGS.items()):
-                if r.conn is None and r.gone_at is not None and now - r.gone_at >= A.idle_release:
-                    del MEETINGS[k]; r.q.put('release')
-            rooms, n = list(MEETINGS.values()), len(MEETINGS)
-        if A.backlog_warn <= 0: continue
+        try: reaper_tick()
+        except Exception as e:   # 이 스레드가 죽으면 끊긴 회의 정리도 멈추므로 로그만 남기고 계속
+            log(f'정리 스레드 오류 (계속 돎): {e!r}')
+
+
+def update_ready(rooms, n, now):
+    """--ready-when-full: 새 회의를 받을지 정해 READY에 둠 (/ready는 이 값만 읽음). 바뀔 때만 로그"""
+    stats = []
+    for r in rooms:
+        b = r.q.qsize() * 0.1
+        eng = r.engine; fed = eng.fed if eng is not None else None
+        prev, r.ready_prev = r.ready_prev, (fed, now)
+        spent = now - prev[1] if prev else 0.0
+        done = fed - prev[0] if prev and fed is not None and prev[0] is not None else spent   # 모르면 밀림으로 보지 않음
+        stats.append((r.key, b, done, spent))
+    busy, reason = readiness.decide(READY['busy'], n, A.max_meetings, A.ready_margin, stats, A.ready_backlog)
+    if busy != READY['busy']:
+        log(f'새 회의를 받지 않음 (/ready 503): {reason}' if busy else f'새 회의를 다시 받음 (/ready 200, 열린 회의 {n}개)')
+    READY['reason'] = reason; READY['busy'] = busy
+
+
+def reaper_tick():
+    now = time.monotonic()
+    with MLOCK:
+        for k, r in list(MEETINGS.items()):
+            if r.conn is None and r.gone_at is not None and now - r.gone_at >= A.idle_release:
+                del MEETINGS[k]; r.q.put('release')
+        rooms, n = list(MEETINGS.values()), len(MEETINGS)
+    if A.ready_when_full:
+        try: update_ready(rooms, n, now)
+        except Exception as e:   # 판단이 틀어져도 막히는 쪽보다 받는 쪽이 안전 (파드가 통째로 ALB에서 빠지지 않게)
+            READY['busy'] = False; READY['reason'] = ''
+            log(f'새 회의 받기 판단 오류 (받는 쪽으로 둠): {e!r}')
+    if A.backlog_warn > 0:
         for r in rooms:
             b = r.q.qsize() * 0.1
             if not r.backlog_warned and b >= A.backlog_warn:
@@ -956,7 +1007,9 @@ def main():
         threading.Thread(target=serve_ws, daemon=True).start()
         threading.Thread(target=reaper, daemon=True).start()
         source = f'WebSocket ws://{A.ws_host}:{A.ws_port}'
-        log(f'WebSocket 입력 대기: {source}  동시 회의 {f"최대 {A.max_meetings}개" if A.max_meetings > 0 else "상한 없음"}  시험용 보내는 화면: http://localhost:{A.port}/sender')
+        log(f'WebSocket 입력 대기: {source}  동시 회의 {f"최대 {A.max_meetings}개" if A.max_meetings > 0 else "상한 없음"}'
+        + (f'  꽉 차거나 밀리면 /ready 503 (밀림 {A.ready_backlog:g}초, 여유 {A.ready_margin}자리)' if A.ready_when_full else '')
+        + f'  시험용 보내는 화면: http://localhost:{A.port}/sender')
     else:
         source = A.wav or f'마이크 {A.device or "기본"} ({A.input})'
         LOCAL = Room('local', source); remember(LOCAL)
