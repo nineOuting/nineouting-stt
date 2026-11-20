@@ -1,65 +1,66 @@
-# STT를 로컬에서 빌드·검증한 뒤 DEV ECR에 직접 게시한다.
-# PR/수동 실행은 검증만 수행하며 develop push만 ECR 및 GitOps PR을 생성한다.
+# Build and verify locally, then publish directly to DEV ECR.
 name: image
-on:
-  push:
-    branches: [develop]
-    paths:
-      - 'prototype/**'
-      - '.github/workflows/image.yml'
-  pull_request:
-    paths:
-      - 'prototype/**'
-      - '.github/workflows/image.yml'
-  workflow_dispatch:
-permissions:
-  contents: read
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            pair: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            pair: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Test ECR publish failure paths (offline)
+        run: python3 .github/scripts/test_publish_dev_ecr.py
       - name: 모델 다운로드 재시도 단위 검증
         run: python3 -m unittest discover -s prototype/tools -p test_download_models.py
       - uses: docker/setup-buildx-action@v3
-      - name: AMD64 이미지 빌드
+      - name: Build local image
         uses: docker/build-push-action@v6
         with:
           context: prototype
-          platforms: linux/amd64
+          platforms: ${{ matrix.platform }}
           load: true
-          tags: nineouting-stt:verified
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha,scope=linux-amd64
-          cache-to: type=gha,scope=linux-amd64,mode=max
+          tags: nineouting-verified:local
+          cache-from: type=gha,scope=${{ matrix.pair }}
+          cache-to: type=gha,scope=${{ matrix.pair }},mode=max
+      - name: 확인할 이미지
+        run: echo "REF=nineouting-verified:local" >> "$GITHUB_ENV"
+      - name: 이미지 크기
+        run: |
+          size=$(docker image inspect "$REF" --format '{{.Size}}')
+          echo "${{ matrix.platform }} 이미지 크기(압축 풀린 상태): $((size / 1000000)) MB (${size} bytes)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: 모델 확인
         run: |
-          docker run --rm --network none -e PYTHONPATH=/app/app nineouting-stt:verified python -c "
+          docker run --rm --network none -e PYTHONPATH=/app/app "$REF" python -c "
           import os, platform
           from engine import make_rec, DEFAULT_MODELS
           rec = make_rec(DEFAULT_MODELS + '/zipformer-174m', '64', 'modified_beam_search',
                          hotwords='/app/app/hotwords.txt')
           rec.create_stream()
-          assert os.path.exists(DEFAULT_MODELS + '/speaker/silero_vad.onnx')
-          open('/app/transcripts/.write-check', 'w').close()
-          assert platform.machine() == 'x86_64'
-          "
+          assert os.path.exists(DEFAULT_MODELS + '/speaker/silero_vad.onnx'), 'VAD 모델 없음'
+          open('/app/transcripts/.write-check', 'w').close()   # 실행 사용자가 전사 폴더에 쓸 수 있는지
+          print('모델 확인 uid=%d arch=%s 전사 폴더 쓰기 됨' % (os.getuid(), platform.machine()))
+          " | tee -a "$GITHUB_STEP_SUMMARY"
       - name: 배포 연결 유지 검증
-        run: docker run --rm --network none nineouting-stt:verified python -m unittest discover -s tools -p 'test_drain*.py'
-      - name: 검증 이미지 저장
-        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-        run: docker save nineouting-stt:verified | gzip > verified-image.tar.gz
+        run: docker run --rm --network none "$REF" python -m unittest discover -s tools -p 'test_drain*.py'
+      - name: Save exact built image
+        if: matrix.platform == 'linux/amd64' && (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+        run: docker save nineouting-verified:local | gzip > verified-image.tar.gz
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        if: matrix.platform == 'linux/amd64' && (github.event_name == 'push' && github.ref == 'refs/heads/develop')
         with:
-          name: verified-stt-image
+          name: verified-image-${{ github.run_id }}-${{ github.run_attempt }}
           path: verified-image.tar.gz
           retention-days: 1
           if-no-files-found: error
-
   dev-ecr:
     name: Verify and publish DEV ECR image
     needs: build
@@ -73,11 +74,13 @@ jobs:
       AWS_REGION: ap-northeast-2
       EXPECTED_ACCOUNT: '443845329525'
       TARGET_IMAGE: 443845329525.dkr.ecr.ap-northeast-2.amazonaws.com/nineouting-dev-stt
+      LOCAL_IMAGE: nineouting-verified:local
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: verified-stt-image
-      - name: 검증 이미지 불러오기
+          name: verified-image-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Load verified image
         run: gunzip -c verified-image.tar.gz | docker load
       - uses: docker/setup-buildx-action@v3
       - name: Authenticate to DEV with OIDC
@@ -87,30 +90,17 @@ jobs:
           aws-region: ap-northeast-2
           role-session-name: gha-${{ github.run_id }}
       - name: Check account
+        shell: bash
         run: |
           set -euo pipefail
-          test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED_ACCOUNT"
-      - uses: aws-actions/amazon-ecr-login@v2
-      - name: 검증 이미지를 ECR에 직접 게시
-        run: |
-          set -euo pipefail
-          tag="sha-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          target="$TARGET_IMAGE:$tag"
-          local_id=$(docker image inspect nineouting-stt:verified --format '{{.Id}}')
-          test "$(docker image inspect nineouting-stt:verified --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
-          docker tag nineouting-stt:verified "$target"
-          docker push "$target"
-          docker buildx imagetools inspect "$target" > ecr-manifest.txt
-          digest=$(awk '$1 == "Digest:" {print $2; exit}' ecr-manifest.txt)
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          docker buildx imagetools inspect --raw "$TARGET_IMAGE@$digest" > ecr-manifest-raw.json
-          test "$(jq -er '.config.digest' ecr-manifest-raw.json)" = "$local_id"
-          docker pull --platform linux/amd64 "$TARGET_IMAGE@$digest"
-          test "$(docker image inspect "$TARGET_IMAGE@$digest" --format '{{.Id}}')" = "$local_id"
-          test "$(docker image inspect "$TARGET_IMAGE@$digest" --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
-          printf 'image.repository=%s\nimage.digest=%s\nimage.tag=%s\nimage.uri=%s\n' \
-            "$TARGET_IMAGE" "$digest" "$tag" "$TARGET_IMAGE@$digest" > image-result.txt
-          echo "Verified DEV ECR image: $TARGET_IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
+          account=$(aws sts get-caller-identity --query Account --output text)
+          test "$account" = "$EXPECTED_ACCOUNT"
+          echo "AWS account verified: $account"
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Publish and verify exact local image in DEV ECR
+        id: publish
+        run: bash .github/scripts/publish-dev-ecr.sh
       - name: Save verified image reference
         uses: actions/upload-artifact@v4
         with:
@@ -120,8 +110,6 @@ jobs:
             ecr-manifest.txt
             ecr-manifest-raw.json
           retention-days: 30
-          if-no-files-found: error
-
   dev-gitops:
     name: Create verified STT DEV image PR
     needs: dev-ecr
@@ -159,3 +147,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           DEV_GITOPS_TOKEN: ${{ secrets.DEV_GITOPS_TOKEN }}
+'on':
+  push:
+    branches:
+      - develop
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+
+    paths:
+      - prototype/**
+      - .github/workflows/image.yml
+      - .github/scripts/publish-dev-ecr.sh
+      - .github/scripts/test_publish_dev_ecr.py
+  pull_request:
+    paths:
+      - prototype/**
+      - .github/workflows/image.yml
+      - .github/scripts/publish-dev-ecr.sh
+      - .github/scripts/test_publish_dev_ecr.py
+  workflow_dispatch: null
