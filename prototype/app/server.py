@@ -93,6 +93,11 @@ p.add_argument('--backlog-warn', type=float, default=float(os.environ.get('BACKL
                help='--input ws: 회의의 밀린 소리가 이 초를 넘으면 로그에 남김 (.env BACKLOG_WARN_SEC, 0이면 끔). 1초 밑으로 내려오면 풀림도 남김')
 p.add_argument('--idle-release', type=float, default=float(os.environ.get('MEETING_IDLE_SEC') or 600),
                help='--input ws: 연결이 끊긴 회의를 이 초만큼 기다린 뒤 정리함 (.env MEETING_IDLE_SEC). end는 보내지 않음')
+p.add_argument('--replace-max', type=int, default=int(os.environ.get('REPLACE_MAX') or 5),
+               help='--input ws: 한 회의의 연결이 --replace-window초 안에 이 횟수만큼 바뀌었으면 새 연결을 4002로 거절하고 지금 연결을 지킴 '
+                    '(.env REPLACE_MAX, 0이면 끔). 같은 회의를 연 브라우저 둘이 서로 밀어내기를 반복하지 않게 함. 기본 5는 추정값')
+p.add_argument('--replace-window', type=float, default=float(os.environ.get('REPLACE_WINDOW_SEC') or 60),
+               help='--input ws: --replace-max를 세는 시간(초) (.env REPLACE_WINDOW_SEC)')
 p.add_argument('--no-ticket', action='store_true',
                help='--input ws: 음성 연결 입장권을 확인하지 않음 (백엔드 없이 /sender로 시험할 때). '
                     '--backend-url이 없으면 어차피 확인하지 않음')
@@ -183,7 +188,11 @@ class Room:
         self.ctrl = queue.Queue()   # 녹음·일시정지·완료 요청. 처리 스레드가 소리 조각 사이에 처리함
         self.q = queue.Queue()      # --input ws: 소리와 제어 메시지를 받은 순서대로 (받는 스레드 → 처리 스레드)
         self.catchup = False     # 밀린 소리가 1초 넘게 쌓임 (다시 연결 뒤 몰아 보내는 중) → 말하는 중 줄은 백엔드로 보내지 않음
-        self.conn = None         # --input ws: 지금 붙어 있는 연결
+        # --input ws 연결 상태(conn·gone_at·meeting·ms·skip·shift·replaced)는 clock으로 지킴. 받는 스레드가 0.1초마다 잡으므로,
+        # 처리 스레드가 줄을 내보내며 파일까지 쓰는 lock과 나눔
+        self.clock = threading.Lock()
+        self.replaced = collections.deque()   # 연결이 바뀐 시각 (monotonic, 최근 --replace-window초만)
+        self.conn = None         # --input ws: 지금 붙어 있는 연결 (이 연결이 보낸 것만 회의에 넣음)
         self.meeting = None      # --input ws: start를 받은 meetingId
         self.ms = 0.0            # 그 회의에서 받은 소리(ms)
         self.skip = 0            # 다시 연결 뒤 겹쳐서 버릴 바이트
@@ -450,6 +459,10 @@ def latest_room():
 #   같은 meetingId로 새 연결이 오면 그 회의의 이전 연결만 닫고 이어받음 (CN팀 S6을 회의별로).
 #   끊긴 것을 서버가 아직 모르는 사이에 브라우저가 다시 붙어도 막히지 않게 함. 자리를 내준 연결은 4001로 닫아
 #   브라우저가 "내가 밀려남"과 "그냥 끊김"을 구분할 수 있게 함. 다른 회의의 연결은 건드리지 않음
+#   밀려난 연결이 닫히기 전까지 보낸 소리·제어 메시지는 버림 (SCRUM-335). 이전 연결이 살아 있으면(창 둘) 닫히는 사이에도
+#   소리가 계속 오고, 라이브러리는 닫히는 중에도 받은 것을 넘겨주므로, 버리지 않으면 같은 구간이 두 번 들어가 시각이 밀림
+#   한 회의의 연결이 --replace-window초 안에 --replace-max번 바뀌었으면 새 연결을 4002로 닫고 지금 연결을 지킴.
+#   창 둘이 4001을 받고도 다시 붙으면 서로 밀어내기를 끝없이 반복하므로 막음. 4002도 다시 붙지 않아야 함
 #   열린 회의가 --max-meetings에 닿으면 새 회의 연결은 1013(잠시 뒤 다시)으로 닫음. 입장권 주소로 회의를 알 수 있으면 입장권을 쓰기 전에 거절함
 #   작성자 확인은 백엔드 몫이라 하지 않음
 # 받는 스레드는 소리와 제어 메시지를 그 회의 Room의 대기열에 순서대로 넣고, Room의 처리 스레드가 받은 순서대로 처리함
@@ -544,6 +557,7 @@ def ws_handler(conn):
     auth = ws_auth(conn)
     if auth is False: return
     room = None
+    dropped = [0, 0]   # 밀려난 뒤 버린 소리(바이트)·메시지 수
     with MLOCK: CONNS.add(conn)
     try:   # 등록한 뒤부터는 어떤 오류가 나도 아래 finally에서 정리되어야 함
         try: peer = conn.remote_address   # 상대가 벌써 끊었으면 소켓 주소를 못 읽음
@@ -551,16 +565,22 @@ def ws_handler(conn):
         log(f'WebSocket 연결: {peer}' + (f' (회의 {pmid})' if pmid else ''))
         for msg in conn:
             if isinstance(msg, bytes):
-                if room is None or room.meeting is None: continue   # start 전 소리는 버림
-                if room.skip:                                # 다시 연결 뒤 이미 받은 부분
-                    k = min(room.skip, len(msg)); msg = msg[k:]; room.skip -= k
-                if len(msg) % 2: msg = msg[:-1]
-                if msg: room.q.put(msg); room.ms += len(msg) / MS
+                if room is None: continue   # start 전 소리는 버림
+                with room.clock:   # 주인 확인과 넣기를 한 번에: 사이에 새 연결이 ms·skip을 계산하면 틀어짐
+                    if room.conn is not conn or room.meeting is None:
+                        if room.conn is not conn: dropped[0] += len(msg)
+                        continue
+                    if room.skip:                                # 다시 연결 뒤 이미 받은 부분
+                        k = min(room.skip, len(msg)); msg = msg[k:]; room.skip -= k
+                    if len(msg) % 2: msg = msg[:-1]
+                    if msg: room.q.put(msg); room.ms += len(msg) / MS
                 continue
             try: m = json.loads(msg)
             except ValueError:
                 say(type='error', message='JSON이 아님'); continue
             t = m.get('type')
+            if room is not None and room.conn is not conn:   # 밀려난 연결: start로 되찾지도, pause·end로 회의를 건드리지도 못함
+                dropped[1] += 1; continue
             if t == 'start':
                 mid = str(m.get('meetingId') or '').strip(); off = float(m.get('offsetMs') or 0)
                 if not mid.isdigit():   # 백엔드 회의 번호는 숫자뿐 (CN팀 S5). 틀린 번호로 전사가 나가지 않게 연결을 끊음
@@ -580,42 +600,62 @@ def ws_handler(conn):
                             r.thread = threading.Thread(target=r.ws_main, daemon=True); r.thread.start()
                 if r is False: reject_full(conn, say, mid); return
                 remember(r)
+                with r.clock:   # 주인 바꾸기부터 ms·skip 계산까지 한 번에 (밀려난 연결의 받는 스레드가 사이에 끼지 못하게)
+                    old, rejected = r.conn, False
+                    if old is not None and old is not conn:
+                        now = time.monotonic()
+                        while r.replaced and now - r.replaced[0] > A.replace_window: r.replaced.popleft()
+                        if A.replace_max > 0 and len(r.replaced) >= A.replace_max:
+                            rejected = True   # 거절: 지금 연결을 지킴 (거절은 세지 않으므로 조용히 --replace-window초가 지나면 다시 받음)
+                        else:
+                            r.replaced.append(now)
+                    if not rejected:
+                        r.conn, r.gone_at = conn, None
+                        if mid == r.meeting and off == 0 and r.ms - r.shift >= FRESH_MS:
+                            # 새로 연 브라우저(새로고침 등)는 0부터 셈. 겹침으로 보고 버리면 앞서 받은 길이만큼 새 말이 사라지므로,
+                            # 버리지 않고 받은 위치 뒤에 이어 붙임. 줄 시각은 서버가 계산하므로 틀어지지 않음
+                            # 이때부터 브라우저 시계가 서버보다 r.ms만큼 늦으므로 그 차이(shift)를 기억해, 뒤의 다시 연결에서 offsetMs에 더함
+                            # (회의가 이미 정리됐거나 STT가 다시 켜진 뒤의 새로고침은 여기서 막지 못함: 브라우저가 이어서 셀 위치를 보내야 함)
+                            fresh = r.ms; gap = 0
+                            r.skip = 0; r.shift = r.ms
+                        elif mid == r.meeting:                   # 같은 회의로 다시 연결
+                            fresh = None
+                            gap = off + r.shift - r.ms         # 브라우저 시계를 서버 시계로 바꿔 비교
+                            if gap > 0:                        # 빈 시간은 무음으로 채워 시각을 맞춤
+                                z = bytes(int(gap) * MS)
+                                for i in range(0, len(z), 3200): r.q.put(z[i:i + 3200])
+                                r.ms += int(gap)
+                            elif gap < 0: r.skip = int(-gap) * MS
+                        else:
+                            fresh = None; gap = 0
+                            r.meeting, r.ms, r.skip, r.shift = mid, off, 0, 0.0
+                            r.q.put(('start', mid, off / 1000))
+                        ready_ms = round(r.ms - r.shift)   # 브라우저 시계 기준
+                if rejected:
+                    log(f'{r.tag}{A.replace_window:.0f}초 동안 연결이 {A.replace_max}번 바뀌어 새 연결을 거절함 '
+                        f'(같은 회의를 연 창이 둘 이상인지 확인)')
+                    try: say(type='error', message='같은 회의의 연결이 너무 자주 바뀜. 다른 창에서 이 회의를 쓰는 중인지 확인')
+                    except Exception: pass
+                    conn.close(4002, 'replaced too often'); return
                 if room is not None and room is not r:   # 같은 연결이 다른 회의로 start: 앞 회의에서 떼기만 함 (정리 시간이 지나면 정리)
-                    with room.lock:
+                    with room.clock:
                         if room.conn is conn: room.conn = None; room.gone_at = time.monotonic()
                 room = r
-                with room.lock:
-                    old, room.conn, room.gone_at = room.conn, conn, None
                 if old is not None and old is not conn:
                     log(f'{room.tag}WebSocket 새 연결이 이전 연결을 대신함')
                     threading.Thread(target=ws_close, args=(old, 4001, 'replaced by a new connection'), daemon=True).start()
-                if mid == room.meeting and off == 0 and room.ms - room.shift >= FRESH_MS:
-                    # 새로 연 브라우저(새로고침 등)는 0부터 셈. 겹침으로 보고 버리면 앞서 받은 길이만큼 새 말이 사라지므로,
-                    # 버리지 않고 받은 위치 뒤에 이어 붙임. 줄 시각은 서버가 계산하므로 틀어지지 않음
-                    # 이때부터 브라우저 시계가 서버보다 room.ms만큼 늦으므로 그 차이(shift)를 기억해, 뒤의 다시 연결에서 offsetMs에 더함
-                    # (회의가 이미 정리됐거나 STT가 다시 켜진 뒤의 새로고침은 여기서 막지 못함: 브라우저가 이어서 셀 위치를 보내야 함)
-                    log(f'{room.tag}offsetMs 0으로 다시 연결 (받은 소리 {room.ms / 1000:.1f}초): 새로 연 브라우저로 보고 이어 붙임')
-                    room.skip = 0; room.shift = room.ms
-                elif mid == room.meeting:                   # 같은 회의로 다시 연결
-                    gap = off + room.shift - room.ms         # 브라우저 시계를 서버 시계로 바꿔 비교
-                    if gap > 0:                            # 빈 시간은 무음으로 채워 시각을 맞춤
-                        if gap > 10000: log(f'{room.tag}다시 연결: {gap / 1000:.1f}초가 비어 무음으로 채움')
-                        z = bytes(int(gap) * MS)
-                        for i in range(0, len(z), 3200): room.q.put(z[i:i + 3200])
-                        room.ms += int(gap)
-                    elif gap < 0: room.skip = int(-gap) * MS
-                else:
-                    room.meeting, room.ms, room.skip, room.shift = mid, off, 0, 0.0
-                    room.q.put(('start', mid, off / 1000))
-                say(type='ready', meetingId=mid, meetingMs=round(room.ms - room.shift))   # 브라우저 시계 기준
+                if fresh is not None:
+                    log(f'{room.tag}offsetMs 0으로 다시 연결 (받은 소리 {fresh / 1000:.1f}초): 새로 연 브라우저로 보고 이어 붙임')
+                elif gap > 10000: log(f'{room.tag}다시 연결: {gap / 1000:.1f}초가 비어 무음으로 채움')
+                say(type='ready', meetingId=mid, meetingMs=ready_ms)
             elif t in ('pause', 'resume'):
                 if room is not None: room.q.put(t)
             elif t == 'end':
                 if room is not None:
                     with MLOCK:   # 바로 자리를 비움: 같은 회의로 다시 start하면 새 Room을 엶
                         if MEETINGS.get(room.key) is room: del MEETINGS[room.key]
-                    room.q.put('complete'); room.meeting = None
-                    with room.lock:
+                    with room.clock:
+                        room.q.put('complete'); room.meeting = None
                         if room.conn is conn: room.conn = None
                     room = None
                 say(type='ended')
@@ -626,10 +666,12 @@ def ws_handler(conn):
     finally:
         with MLOCK: CONNS.discard(conn)
         if room is not None:
-            with room.lock:
+            with room.clock:
                 mine = room.conn is conn   # 이미 다른 연결이 들어왔으면 그쪽을 지우지 않음
                 if mine: room.conn = None; room.gone_at = time.monotonic()
             if mine: log(f'{room.tag}WebSocket 연결 끊김 (회의는 열린 채 다시 연결을 기다림, 최대 {A.idle_release:.0f}초)')
+            if dropped[0] or dropped[1]:
+                log(f'{room.tag}밀려난 연결에서 온 소리 {dropped[0] / MS / 1000:.1f}초·메시지 {dropped[1]}개를 버림')
 
 
 def reaper():
