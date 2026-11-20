@@ -121,8 +121,11 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 
 - 백엔드: `POST {backend-url}/internal/meetings/{meetingId}/transcripts`, 본문 `{"segments": [...]}`. 0.5초마다 바뀐 줄만 보내고, 실패하면 다음 주기에 다시 보냄. 필드 설명은 `app/backend_sender.py` 첫머리
 - 브라우저 → STT (WebSocket, `ws://localhost:8770`)
-  - 상태 확인: `GET /health` → `{"ok": true, "input": "ws", "connected": true, "connections": 2, "draining": false, "meetings": ["12", "13"], "maxMeetings": 4, "full": false, "backlog": {"12": 0.0, "13": 0.1}}` (`backlog`: 회의별로 아직 처리하지 못한 소리(초). 계속 늘면 회의 수를 감당하지 못하는 것). 입력 서버가 죽었으면 `503` (회의 하나의 오류는 그 회의만 닫고 `roomErrors`에 셈). **음성 포트와 개발 화면 포트 양쪽에 있음** — 운영에서는 개발 화면 포트를 닫으므로 바깥에서는 음성 포트로 확인
-  - 받을 준비: `GET /ready` → drain 중이면 `503`. 회의가 다 차도 `200` (DEV는 파드가 하나라, 503이면 ALB 대상에서 빠져 진행 중인 회의의 다시 연결까지 막힘)
+  - 상태 확인: `GET /health` → `{"ok": true, "input": "ws", "connected": true, "connections": 2, "draining": false, "meetings": ["12", "13"], "maxMeetings": 4, "full": false, "backlog": {"12": 0.0, "13": 0.1}, "resumed": 0}` (`backlog`: 회의별로 아직 처리하지 못한 소리(초). 계속 늘면 회의 수를 감당하지 못하는 것. `resumed`: 이 프로세스가 처음 여는데 `offsetMs`가 0이 아니었던 회의 수, 즉 다른 파드에서 옮겨 왔거나 STT가 다시 켜진 뒤 이어 온 회의. `--ready-when-full`이면 `ready`와 받지 않는 이유 `busyReason`도 나옴). 입력 서버가 죽었으면 `503` (회의 하나의 오류는 그 회의만 닫고 `roomErrors`에 셈). **음성 포트와 개발 화면 포트 양쪽에 있음** — 운영에서는 개발 화면 포트를 닫으므로 바깥에서는 음성 포트로 확인
+  - 받을 준비: `GET /ready` → drain 중이면 `503`. 기본은 회의가 다 차도 `200` (DEV는 파드가 하나라, 503이면 ALB 대상에서 빠져 진행 중인 회의의 다시 연결까지 막힘)
+    - `--ready-when-full`(`.env READY_WHEN_FULL=1`, 기본 꺼짐)이면 꽉 차거나 밀릴 때도 `503` (SCRUM-337). 파드가 2대 이상이고 ALB 쿠키 고정(스티키 세션)을 쓸 때 켬: 꽉 찬 파드에 고정된 브라우저가 새 회의를 열 때마다 `1013`으로 거절되지 않고 다른 파드로 가게 함. 이미 붙은 연결은 그대로 남음
+    - 꽉 참: 열린 회의가 상한(`MAX_MEETINGS`)에 닿음. 밀림: 어느 회의든 밀린 소리가 `--ready-backlog`초(`.env READY_BACKLOG_SEC`, 기본 5, 추정값)를 넘고 실시간보다 느리게 처리함. 다시 붙은 회의가 모아 둔 소리를 몰아 보낼 때는 실시간보다 빨리 처리하므로 밀림으로 보지 않음
+    - 다시 받기: `--ready-margin`자리(`.env READY_MARGIN`, 기본 1)가 비고 모든 회의의 밀린 소리가 1초 밑. 판단은 5초마다 하고, 바뀔 때만 로그(`새 회의를 받지 않음`, `새 회의를 다시 받음`)
   - 연결 주소: `/ws/stt/meetings/{meetingId}?ticket=…` (Gateway를 거쳐도 경로가 그대로 옴)
   - 입장권 확인: 연결을 받으면 STT가 `POST {backend-url}/internal/stt-tickets/{ticket}/consume`을 한 번 부름. 401이거나 백엔드가 3초 안에 답하지 못하면 `1008`로 거절. 연결 주소·`start` 메시지·확인 응답의 `meetingId`가 **모두 같아야** 받아들임
     - 입장권은 30초 유효하고 한 번 쓰면 지워짐. 다시 연결할 때는 브라우저가 새로 받아 와야 함
