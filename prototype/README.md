@@ -153,15 +153,12 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 
 ## 이미지
 
-`develop`에 들어갈 때마다 GitHub Actions가 만들어 GHCR에 올립니다.
-
-```bash
-docker pull ghcr.io/nineouting/nineouting-stt:develop
-docker run -p 8770:8770 -e BACKEND_URL=http://meeting-service:8083 ghcr.io/nineouting/nineouting-stt:develop
-```
-
-- **플랫폼: `linux/amd64`와 `linux/arm64`.** 하나의 태그에 둘 다 들어 있어 받는 쪽 CPU에 맞는 것이 자동으로 내려옵니다. 일부러 고르려면 `docker pull --platform linux/amd64 …`
-- 태그: `develop`에 들어가면 `:develop`과 커밋 SHA, 릴리스 git 태그(`v<major>.<minor>.<patch>`, 예: `v0.1.0`)를 올리면 같은 이름(`:v0.1.0`)과 커밋 SHA. ai-service와 같은 모양이고, 릴리스 태그는 `:develop`을 옮기지 않습니다
+개발 배포 이미지는 GitHub Actions에서 빌드·검증한 뒤 **DEV ECR에 직접 게시**합니다.
+- 플랫폼: `linux/amd64` (현재 DEV EKS). ARM64 개발 환경은 아래 명령으로 로컬 빌드합니다.
+- `develop` push만 게시하며 태그는 `sha-<commit>-<run>-<attempt>`입니다.
+- PR과 수동 실행은 이미지 검증만 수행합니다. 릴리스 태그 게시와 PROD 배포는 이 workflow에 포함되지 않습니다.
+- 검증된 ECR digest로 infra DEV PR을 생성하고, 기존 GitOps 정책에 따라 병합 후 Argo CD가 반영합니다.
+- 자세한 인증·검증 흐름은 [DEV-ECR.md](../DEV-ECR.md)를 참고합니다.
 - 모델은 이미지 안에 들어 있어(약 160MB) 실행할 때 받지 않습니다
 - 기본값으로 음성 포트만 열립니다 (`WS_HOST=0.0.0.0`, `STT_HOST=127.0.0.1`). 개발 화면은 로그인이 없으므로 운영에서 열지 마세요
 - 상태 확인: `GET :8770/health`
