@@ -1,10 +1,15 @@
-# DEV ECR 전송
-기존 develop GHCR 멀티 플랫폼 빌드 및 모델 검사를 유지한다. merge Job의 metadata Digest를
-전달받아 amd64만 DEV ECR로 복사한다. 다른 브랜치·태그·PR·수동 실행은 ECR Job을 실행하지 않는다.
-DEV 계정 443845329525, Role nineouting-dev-stt-github, 저장소 nineouting-dev-stt가 선행 조건이다.
-OIDC subject는 repo:nineOuting@341826954/nineouting-stt@1416587196:ref:refs/heads/develop 이다.
-GitHub Environment는 사용하지 않는다. 장기 AWS 키는 불필요하다.
-원본/목적지 config·layer Digest와 실제 linux/amd64를 검증한 후 image-result.txt를 Artifact로 제공한다.
-태그는 SHA/run ID/attempt로 유일하게 생성한다. 실패 시 후속 배포는 없다.
-이 Workflow는 인프라 Values 갱신, ArgoCD Sync, EKS 배포를 수행하지 않는다.
-검증된 ECR Digest를 인프라 PR로 반영하고 별도 승인 후 수동 Sync한다.
+# DEV ECR 직접 게시
+
+서비스 코드 빌드·검증 후 동일 로컬 이미지를 Actions artifact로 전달해 ECR에 직접 게시합니다.
+- 저장소: `443845329525.dkr.ecr.ap-northeast-2.amazonaws.com/nineouting-dev-stt`
+- 기존 OIDC 역할과 게시 조건을 유지합니다.
+- DEV 게시 이미지는 `linux/amd64`입니다. Python의 기존 AMD64·ARM64 모델/코드 검증은 유지합니다.
+- 태그는 `sha-<commit>-<run>-<attempt>`이며 manifest의 config digest와 로컬 이미지 ID, 다시 받은 이미지 ID·플랫폼을 검증합니다.
+- `dev-ecr-image-<run>-<attempt>` artifact와 `image-result.txt`의 기존 4개 항목을 유지합니다.
+- GitOps 작업이 있는 서비스는 기존 방식대로 infra digest 변경 PR을 생성합니다. Argo CD 반영은 infra 정책을 따릅니다.
+- 공통 모듈 Maven 저장소와 `GPR_TOKEN`은 유지합니다.
+
+PR은 검증만 하며 ECR에 게시하지 않습니다. 이 변경은 Argo CD 정책이나 `prune=false`를 수정하지 않습니다.
+Python 릴리스 태그는 이미지 검증만 수행하며 DEV ECR 게시 대상이 아닙니다.
+
+검사: `actionlint`, `shellcheck .github/scripts/publish-dev-ecr.sh`, `python3 .github/scripts/test_publish_dev_ecr.py`.

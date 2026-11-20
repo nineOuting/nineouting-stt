@@ -1,36 +1,6 @@
-# STT 이미지를 만들어 GHCR(ghcr.io/nineouting/nineouting-stt)에 올림.
-# 같은 조직 레포라 따로 받을 자격증명이 없고, 아래 permissions와 기본 GITHUB_TOKEN이면 됨.
-#
-# 플랫폼: linux/amd64와 linux/arm64(CN팀 노드)를 각자의 빌드 서버에서 만들고, 하나의 태그로 묶음.
-#         받는 쪽은 자기 CPU에 맞는 이미지를 자동으로 받음 (일부러 고르려면 docker pull --platform linux/amd64 ...)
-# 태그: develop 푸시 -> develop + 커밋 SHA (ai-service·백엔드 서비스 레포와 같은 모양)
-#       릴리스 git 태그(v<major>.<minor>.<patch>, 예: v0.1.0) 푸시 -> 같은 이름 + 커밋 SHA (develop 은 옮기지 않음)
-# 끌어 쓰기: docker pull ghcr.io/nineouting/nineouting-stt:develop
-#            docker pull ghcr.io/nineouting/nineouting-stt:v0.1.0
-#
-# 옛 이미지 정리(delete-package-versions)는 두지 않음: 묶음 안쪽 플랫폼 이미지가 GHCR에서 "태그 없는 버전"으로 보여
-# 태그 없는 버전을 지우면 develop 이미지가 깨짐. 공개 패키지라 저장 공간 비용은 없음
+# Build and verify locally, then publish directly to DEV ECR.
 name: image
-
-on:
-  push:
-    branches: [develop]
-    # 릴리스 태그: git tag v0.1.0 && git push origin v0.1.0 (태그 푸시에는 아래 paths 조건이 적용되지 않음)
-    tags: ['v[0-9]+.[0-9]+.[0-9]+']
-    paths:
-      - 'prototype/**'
-      - '.github/workflows/image.yml'
-  pull_request:
-    paths:
-      - 'prototype/**'
-      - '.github/workflows/image.yml'
-  workflow_dispatch:
-
-env:
-  IMAGE: ghcr.io/nineouting/nineouting-stt   # GHCR 주소는 소문자만 받음 (조직 이름은 nineOuting)
-
 jobs:
-  # 플랫폼마다 그 CPU의 빌드 서버에서 만듦 (에뮬레이터보다 빠름)
   build:
     strategy:
       fail-fast: false
@@ -45,66 +15,28 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
-
+      - name: Test ECR publish failure paths (offline)
+        run: python3 .github/scripts/test_publish_dev_ecr.py
       - name: 모델 다운로드 재시도 단위 검증
         run: python3 -m unittest discover -s prototype/tools -p test_download_models.py
-
       - uses: docker/setup-buildx-action@v3
-
-      # pull_request에서는 만들어만 보고 올리지 않음 (고치는 중에 이미지가 쌓이지 않게)
-      - name: GHCR 로그인
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # pull_request: 올리지 않고 이 빌드 서버의 docker에 넣어(load) 아래에서 크기를 재고 모델을 확인함
-      - name: 만들기 (PR)
-        if: github.event_name == 'pull_request'
+      - name: Build local image
         uses: docker/build-push-action@v6
         with:
           context: prototype
           platforms: ${{ matrix.platform }}
           load: true
-          tags: ${{ env.IMAGE }}:pr-${{ matrix.pair }}
+          tags: nineouting-verified:local
           cache-from: type=gha,scope=${{ matrix.pair }}
           cache-to: type=gha,scope=${{ matrix.pair }},mode=max
-
-      # develop: 태그 없이 digest로만 올리고, 아래 merge에서 두 플랫폼을 하나의 태그로 묶음
-      - name: 만들어서 올리기 (digest)
-        id: push
-        if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
-        with:
-          context: prototype
-          platforms: ${{ matrix.platform }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.pair }}
-          cache-to: type=gha,scope=${{ matrix.pair }},mode=max
-
       - name: 확인할 이미지
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "REF=${IMAGE}:pr-${{ matrix.pair }}" >> "$GITHUB_ENV"
-          else
-            echo "REF=${IMAGE}@${{ steps.push.outputs.digest }}" >> "$GITHUB_ENV"
-            docker pull "${IMAGE}@${{ steps.push.outputs.digest }}"
-          fi
-
+        run: echo "REF=nineouting-verified:local" >> "$GITHUB_ENV"
       - name: 이미지 크기
         run: |
           size=$(docker image inspect "$REF" --format '{{.Size}}')
           echo "${{ matrix.platform }} 이미지 크기(압축 풀린 상태): $((size / 1000000)) MB (${size} bytes)" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      # 네트워크 없이 이미지 안의 모델로 인식기를 만들어 봄 (모델 파일과 sherpa-onnx가 이 CPU에서 도는지)
       - name: 모델 확인
         run: |
           docker run --rm --network none -e PYTHONPATH=/app/app "$REF" python -c "
@@ -117,112 +49,46 @@ jobs:
           open('/app/transcripts/.write-check', 'w').close()   # 실행 사용자가 전사 폴더에 쓸 수 있는지
           print('모델 확인 uid=%d arch=%s 전사 폴더 쓰기 됨' % (os.getuid(), platform.machine()))
           " | tee -a "$GITHUB_STEP_SUMMARY"
-
       - name: 배포 연결 유지 검증
         run: docker run --rm --network none "$REF" python -m unittest discover -s tools -p 'test_drain*.py'
-
-      - name: digest 넘기기
-        if: github.event_name != 'pull_request'
-        run: |
-          mkdir -p "${{ runner.temp }}/digests"
-          digest="${{ steps.push.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
-
+      - name: Save exact built image
+        if: matrix.platform == 'linux/amd64' && (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+        run: docker save nineouting-verified:local | gzip > verified-image.tar.gz
       - uses: actions/upload-artifact@v4
-        if: github.event_name != 'pull_request'
+        if: matrix.platform == 'linux/amd64' && (github.event_name == 'push' && github.ref == 'refs/heads/develop')
         with:
-          name: digests-${{ matrix.pair }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
+          name: verified-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verified-image.tar.gz
           retention-days: 1
-
-  # 두 플랫폼 이미지를 하나의 태그(develop 또는 릴리스 태그, 커밋 SHA)로 묶음
-  merge:
-    outputs:
-      image_digest: ${{ steps.merge.outputs.digest }}
-    needs: build
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: GHCR 로그인
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 하나의 태그로 묶기
-        id: merge
-        working-directory: ${{ runner.temp }}/digests
-        run: |
-          # 릴리스 태그 푸시는 릴리스 이름과 SHA, develop 푸시는 develop 과 SHA 를 붙임 (릴리스가 develop 을 옮기지 않게)
-          tags=(-t "${IMAGE}:${GITHUB_SHA}")
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            tags+=(-t "${IMAGE}:${GITHUB_REF_NAME}")
-          else
-            tags+=(-t "${IMAGE}:develop")
-          fi
-          sources=()
-          for digest_file in *; do sources+=("${IMAGE}@sha256:${digest_file}"); done
-          docker buildx imagetools create --metadata-file "$RUNNER_TEMP/stt-merge-metadata.json" \
-            --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            "${tags[@]}" \
-            "${sources[@]}"
-          digest=$(jq -er '.["containerimage.descriptor"].digest' "$RUNNER_TEMP/stt-merge-metadata.json")
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
-      - name: 두 플랫폼이 들어갔는지 확인
-        run: |
-          docker buildx imagetools inspect "${IMAGE}:${GITHUB_SHA}" | tee inspect.txt
-          grep -q "linux/amd64" inspect.txt && grep -q "linux/arm64" inspect.txt
-          echo "묶음 확인: linux/amd64, linux/arm64" | tee -a "$GITHUB_STEP_SUMMARY"
-
+          if-no-files-found: error
   dev-ecr:
     name: Verify and publish DEV ECR image
-    needs: merge
+    needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
-      packages: read
       id-token: write
     env:
       AWS_REGION: ap-northeast-2
       EXPECTED_ACCOUNT: '443845329525'
-      SOURCE_IMAGE: ghcr.io/nineouting/nineouting-stt
-      SOURCE_DIGEST: ${{ needs.merge.outputs.image_digest }}
       TARGET_IMAGE: 443845329525.dkr.ecr.ap-northeast-2.amazonaws.com/nineouting-dev-stt
-
+      LOCAL_IMAGE: nineouting-verified:local
     steps:
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Login to existing GHCR image
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
+          name: verified-image-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Load verified image
+        run: gunzip -c verified-image.tar.gz | docker load
+      - uses: docker/setup-buildx-action@v3
       - name: Authenticate to DEV with OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::443845329525:role/nineouting-dev-stt-github
           aws-region: ap-northeast-2
           role-session-name: gha-${{ github.run_id }}
-
       - name: Check account
         shell: bash
         run: |
@@ -230,129 +96,11 @@ jobs:
           account=$(aws sts get-caller-identity --query Account --output text)
           test "$account" = "$EXPECTED_ACCOUNT"
           echo "AWS account verified: $account"
-
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Publish and verify AMD64 image in ECR
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # 1. 이번 CI에서 생성한 이미지 Digest 검증
-          [[ "$SOURCE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-
-          source="$SOURCE_IMAGE@$SOURCE_DIGEST"
-          tag="sha-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          target="$TARGET_IMAGE:$tag"
-
-          # 2. GHCR의 멀티 아키텍처 Manifest 조회
-          docker buildx imagetools inspect --raw "$source" \
-            > ghcr-index.json
-
-          # 3. EKS에서 사용할 AMD64 Manifest만 선택
-          amd64_digest=$(jq -er '
-            [
-              .manifests[]
-              | select(
-                  .platform.os == "linux"
-                  and .platform.architecture == "amd64"
-                )
-              | .digest
-            ]
-            | if length == 1
-              then .[0]
-              else error("Expected exactly one linux/amd64 image")
-              end
-          ' ghcr-index.json)
-
-          [[ "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-
-          # 원본 AMD64 이미지 Manifest 저장
-          docker buildx imagetools inspect --raw \
-            "$SOURCE_IMAGE@$amd64_digest" \
-            > ghcr-amd64-manifest.json
-
-          # 4. GHCR의 AMD64 이미지를 ECR로 복사
-          # 단일 플랫폼 Manifest 형식 유지
-          docker buildx imagetools create \
-            --prefer-index=false \
-            --tag "$target" \
-            "$SOURCE_IMAGE@$amd64_digest"
-
-          # 5. ECR에 게시된 이미지 Digest 확인
-          docker buildx imagetools inspect "$target" \
-            > ecr-manifest.txt
-
-          digest=$(awk '$1 == "Digest:" {print $2; exit}' \
-            ecr-manifest.txt)
-
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-
-          # ECR 레지스트리의 실제 Manifest 조회
-          docker buildx imagetools inspect --raw \
-            "$TARGET_IMAGE@$digest" \
-            > ecr-manifest-raw.json
-
-          # 6. GHCR 원본과 ECR 이미지 구성 비교
-          source_config=$(jq -er '.config.digest' \
-            ghcr-amd64-manifest.json)
-
-          target_config=$(jq -er '.config.digest' \
-            ecr-manifest-raw.json)
-
-          [[ "$source_config" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "$target_config" =~ ^sha256:[0-9a-f]{64}$ ]]
-
-          if [[ "$source_config" != "$target_config" ]]; then
-            echo "::error::GHCR/ECR image config digest mismatch"
-            exit 1
-          fi
-
-          # 이미지 레이어 Digest 비교
-          source_layers=$(jq -c '[.layers[].digest]' \
-            ghcr-amd64-manifest.json)
-
-          target_layers=$(jq -c '[.layers[].digest]' \
-            ecr-manifest-raw.json)
-
-          if [[ "$source_layers" != "$target_layers" ]]; then
-            echo "::error::GHCR/ECR image layer mismatch"
-            exit 1
-          fi
-
-          # 7. 실제 ECR 이미지 다운로드 및 플랫폼 검증
-          docker pull --platform linux/amd64 \
-            "$TARGET_IMAGE@$digest"
-
-          target_platform=$(docker image inspect \
-            "$TARGET_IMAGE@$digest" \
-            --format '{{.Os}}/{{.Architecture}}')
-
-          if [[ "$target_platform" != "linux/amd64" ]]; then
-            echo "::error::ECR image is not linux/amd64"
-            exit 1
-          fi
-
-          # 8. GitOps 배포에서 사용할 이미지 주소 저장
-          image_uri="$TARGET_IMAGE@$digest"
-
-          printf 'image.repository=%s\nimage.digest=%s\nimage.tag=%s\nimage.uri=%s\n' \
-            "$TARGET_IMAGE" "$digest" "$tag" "$image_uri" \
-            > image-result.txt
-
-          # 9. GitHub Actions 실행 결과 요약
-          {
-            echo '## DEV ECR Publish PASS'
-            echo "- Source: $source"
-            echo "- Source AMD64 digest: $amd64_digest"
-            echo "- Target: $target"
-            echo "- ECR image: $image_uri"
-            echo "- Platform: $target_platform"
-            echo '- Registry image config/layers: MATCH'
-            echo '- Deployment: NOT RUN'
-          } >> "$GITHUB_STEP_SUMMARY"
-
+      - name: Publish and verify exact local image in DEV ECR
+        id: publish
+        run: bash .github/scripts/publish-dev-ecr.sh
       - name: Save verified image reference
         uses: actions/upload-artifact@v4
         with:
@@ -362,7 +110,6 @@ jobs:
             ecr-manifest.txt
             ecr-manifest-raw.json
           retention-days: 30
-
   dev-gitops:
     name: Create verified STT DEV image PR
     needs: dev-ecr
@@ -400,3 +147,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           DEV_GITOPS_TOKEN: ${{ secrets.DEV_GITOPS_TOKEN }}
+'on':
+  push:
+    branches:
+      - develop
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+
+    paths:
+      - prototype/**
+      - .github/workflows/image.yml
+      - .github/scripts/publish-dev-ecr.sh
+      - .github/scripts/test_publish_dev_ecr.py
+  pull_request:
+    paths:
+      - prototype/**
+      - .github/workflows/image.yml
+      - .github/scripts/publish-dev-ecr.sh
+      - .github/scripts/test_publish_dev_ecr.py
+  workflow_dispatch: null

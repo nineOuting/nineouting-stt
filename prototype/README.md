@@ -153,15 +153,13 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 
 ## 이미지
 
-`develop`에 들어갈 때마다 GitHub Actions가 만들어 GHCR에 올립니다.
+GitHub Actions가 이미지를 빌드·검증한 뒤 DEV ECR에 직접 게시합니다.
+- AMD64·ARM64 이미지 검증은 유지하며 DEV ECR에는 AMD64 이미지를 게시합니다.
+- `develop` push의 검증된 digest를 infra PR에 반영하는 기존 GitOps 흐름을 유지합니다.
+- PR·수동 실행·릴리스 태그는 검증만 수행합니다.
+- ECR 사용 시 AWS 로그인 후 `aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin 443845329525.dkr.ecr.ap-northeast-2.amazonaws.com`으로 인증합니다.
+- 게시 결과 `image-result.txt`의 `image.uri`를 사용합니다. 자세한 내용은 [DEV-ECR.md](../DEV-ECR.md)를 참고합니다.
 
-```bash
-docker pull ghcr.io/nineouting/nineouting-stt:develop
-docker run -p 8770:8770 -e BACKEND_URL=http://meeting-service:8083 ghcr.io/nineouting/nineouting-stt:develop
-```
-
-- **플랫폼: `linux/amd64`와 `linux/arm64`.** 하나의 태그에 둘 다 들어 있어 받는 쪽 CPU에 맞는 것이 자동으로 내려옵니다. 일부러 고르려면 `docker pull --platform linux/amd64 …`
-- 태그: `develop`에 들어가면 `:develop`과 커밋 SHA, 릴리스 git 태그(`v<major>.<minor>.<patch>`, 예: `v0.1.0`)를 올리면 같은 이름(`:v0.1.0`)과 커밋 SHA. ai-service와 같은 모양이고, 릴리스 태그는 `:develop`을 옮기지 않습니다
 - 모델은 이미지 안에 들어 있어(약 160MB) 실행할 때 받지 않습니다
 - 기본값으로 음성 포트만 열립니다 (`WS_HOST=0.0.0.0`, `STT_HOST=127.0.0.1`). 개발 화면은 로그인이 없으므로 운영에서 열지 마세요
 - 상태 확인: `GET :8770/health`
