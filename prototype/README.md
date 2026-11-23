@@ -114,6 +114,7 @@ copy .env.example .env      # 윈도우 (맥: cp .env.example .env)
 | `--no-alt`, `--no-diar` | 다른 인식 결과 끄기, 화자 번호 끄기 (메모리 절약) |
 | `--port N`, `--ws-port N` | 화면 포트 (기본 8765), WebSocket 포트 (기본 8770) |
 | `--host`, `--ws-host` | 접속을 받는 범위. 기본 `127.0.0.1`(이 컴퓨터만), 서버에 올릴 때 `0.0.0.0` |
+| `--batch-decode` | 여러 회의를 묶어서 한 번에 디코딩 (기본 꺼짐, `.env` `BATCH_DECODE=1`). 회의가 많을 때 CPU가 줄어듦. 스레드 수 등은 `--help`와 `.env.example` |
 
 `--backend-url`, `--port`, `--ws-port`, `--host`, `--ws-host`, `--models`는 `.env`(`BACKEND_URL`, `STT_PORT`, `WS_PORT`, `STT_HOST`, `WS_HOST`, `NINEOUTING_STT_MODELS`)로도 정할 수 있음.
 

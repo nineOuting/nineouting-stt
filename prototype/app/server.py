@@ -108,6 +108,17 @@ p.add_argument('--ready-backlog', type=float, default=float(os.environ.get('READ
                help='--ready-when-full: 어느 회의든 밀린 소리가 이 초를 넘고 실시간보다 느리게 처리하면 밀림으로 봄 (.env READY_BACKLOG_SEC). 기본 5는 추정값')
 p.add_argument('--ready-margin', type=int, default=int(os.environ.get('READY_MARGIN') or 1),
                help='--ready-when-full: 꽉 찬 뒤 이만큼 자리가 비어야 다시 받음 (.env READY_MARGIN). 오락가락이 심하면 늘림')
+p.add_argument('--batch-decode', action='store_true',
+               default=os.environ.get('BATCH_DECODE', '').strip().lower() in ('1', 'true', 'yes', 'on'),
+               help='여러 회의를 묶어서 한 번에 디코딩 (.env BATCH_DECODE, 기본 꺼짐). 회의가 많을 때 회의당 CPU 감소(4코어 28개에서 -23%%, 2026-11-23). '
+                    '결과가 같은 묶음에 든 다른 회의에 따라 달라짐 (CER은 크게 달라지지 않음, docs/notes.md)')
+p.add_argument('--decode-threads', type=int, default=int(os.environ.get('DECODE_THREADS') or 0),
+               help='--batch-decode: 디코딩 스레드 수 (.env DECODE_THREADS). 0이면 컨테이너 CPU 상한 - 1 (최소 1). '
+                    '스레드 하나는 코어 1개만 씀')
+p.add_argument('--decode-batch', type=int, default=int(os.environ.get('DECODE_BATCH') or 12),
+               help='--batch-decode: 한 번에 묶는 최대 회의 수 (.env DECODE_BATCH). 기본 12는 시험에서 결과가 좋았던 값')
+p.add_argument('--decode-gather', type=float, default=float(os.environ.get('DECODE_GATHER_MS') or 30),
+               help='--batch-decode: 묶음을 모으려고 기다리는 최대 시간(ms) (.env DECODE_GATHER_MS). 늘리면 묶음이 커지고 자막이 그만큼 늦어짐')
 p.add_argument('--no-ticket', action='store_true',
                help='--input ws: 음성 연결 입장권을 확인하지 않음 (백엔드 없이 /sender로 시험할 때). '
                     '--backend-url이 없으면 어차피 확인하지 않음')
@@ -481,11 +492,34 @@ def latest_room():
 # 받는 스레드는 소리와 제어 메시지를 그 회의 Room의 대기열에 순서대로 넣고, Room의 처리 스레드가 받은 순서대로 처리함
 
 
+def cpu_limit():
+    """컨테이너 CPU 상한 (cgroup). 없거나 읽지 못하면 None"""
+    try:
+        q, per = open('/sys/fs/cgroup/cpu.max').read().split()   # cgroup v2: "200000 100000" 또는 "max 100000"
+        return None if q == 'max' else int(q) / int(per)
+    except (OSError, ValueError):
+        pass
+    try:
+        q = int(open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us').read()); per = int(open('/sys/fs/cgroup/cpu/cpu.cfs_period_us').read())
+        return None if q <= 0 else q / per
+    except (OSError, ValueError):
+        return None
+
+
+def decode_threads():
+    """--batch-decode 디코딩 스레드 수: 지정값, 없으면 CPU 상한(없으면 보이는 CPU 수) - 1, 최소 1"""
+    if A.decode_threads > 0: return A.decode_threads
+    cpus = cpu_limit() or os.cpu_count() or 1
+    return max(1, int(round(cpus)) - 1)
+
+
 def health():
     """상태 확인용 내용과 HTTP 코드. 입력 서버나 로컬 입력 스레드가 죽었으면 503을 내서,
     프로세스는 떠 있는데 전사가 멈춘 상태를 밖에서 알 수 있게 함. 회의 하나의 오류는 그 회의만 닫으므로 503을 내지 않음"""
     ok = bool(PROC['running'])
     body = {'ok': ok, 'input': A.input, 'connected': bool(CONNS), 'connections': len(CONNS), 'draining': draining()}
+    sh = globals().get('SHARED'); d = sh.decoder if sh else None   # 묶어서 디코딩 설정 (측정 결과에 같이 남기려고)
+    body['decode'] = {'batch': True, 'threads': d.threads, 'maxBatch': d.batch, 'gatherMs': round(d.gather * 1000)} if d else {'batch': False}
     if WS_MODE:
         with MLOCK: ms = sorted(MEETINGS); rs = [MEETINGS[k] for k in ms]
         # backlog: 처리 스레드가 아직 못 넣은 소리(초). 계속 늘면 이 서버가 회의 수를 감당하지 못하는 것
@@ -992,7 +1026,12 @@ def main():
     signal.signal(signal.SIGTERM, on_sigterm)
     SHARED = Shared(model_dir=f'{A.models}/zipformer-174m', vad_model=f'{A.models}/speaker/silero_vad.onnx', chunk=A.chunk,
                     hotwords=A.hotwords, hotwords_score=A.hotwords_score, spk_model=f'{A.models}/speaker/nemo_en_titanet_small.onnx',
-                    diar=not A.no_diar, alt=not A.no_alt, max_len=A.max_len, blank_penalty=A.blank_penalty)
+                    diar=not A.no_diar, alt=not A.no_alt, max_len=A.max_len, blank_penalty=A.blank_penalty,
+                    batch=A.batch_decode, decode_threads=decode_threads() if A.batch_decode else 1,
+                    decode_batch=A.decode_batch, decode_gather=A.decode_gather / 1000)
+    if SHARED.decoder:
+        d = SHARED.decoder
+        log(f'묶어서 디코딩 켬: 스레드 {d.threads}개, 한 번에 최대 {d.batch}개, 모으는 시간 {d.gather * 1000:g}ms')
     wss = th = None
     if WS_MODE:
         from websockets.sync.server import serve
