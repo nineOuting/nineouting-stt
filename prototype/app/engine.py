@@ -22,6 +22,9 @@
 여러 회의: 모델은 Shared에 한 번만 올리고 회의마다 Engine(on_event, shared=…)를 만듦 (SCRUM-288).
   인식기 하나에서 회의마다 스트림을 따로 만들어 각자의 스레드에서 디코딩함. 혼자 돌린 결과와 같음 (docs/notes.md 시험 기록)
   shared 없이 Engine()을 부르면 전용 Shared를 만들어 지금까지와 같게 동작함
+  묶어서 디코딩 (Shared(batch=True), 기본 꺼짐): 회의 스레드가 디코딩할 차례가 되면 BatchDecoder 대기열에 넣고,
+  디코딩 스레드 여러 개가 준비된 회의를 최대 batch개씩 모아 decode_streams로 한 번에 계산함. 회의당 CPU 약 30% 감소,
+  CER은 녹음마다 방향이 달라 크게 달라지지 않음. 다만 결과가 같은 묶음에 든 다른 회의에 따라 달라짐 (docs/notes.md 2026-11-21)
 
 소리를 feed()로 0.1초씩 넣으면 on_event(dict)가 호출됨 (alt는 작업 스레드에서 호출됨).
   {'type': 'partial',   'id', 'start', 'text'}                          말하는 중 (같은 id가 계속 갱신)
@@ -32,7 +35,7 @@
   kind: 'backchannel'(맞장구) / 'filler'(간투사) / None (line_kind 참고)
   {'type': 'alt',       'id', 'alts': [{'name', 'text'}, ...]}         같은 구간의 다른 인식 결과 (기본과 다른 것만)
 """
-import collections, os, queue, re, threading, types
+import collections, os, queue, re, threading, time, types
 import numpy as np
 import sherpa_onnx
 
@@ -198,6 +201,43 @@ class AltWorker:
         with self.cv: self.cv.wait_for(lambda: self.left[id(on_event)] <= 0, timeout)
 
 
+class BatchDecoder:
+    """여러 회의의 스트림을 모아 한 번에 디코딩 (decode_streams).
+    회의 스레드가 decode(s)를 부르면 대기열에 넣고, 그 스트림이 더 디코딩할 것이 없어질 때까지 기다림
+    (기다리는 동안 그 회의는 스트림을 건드리지 않음). 디코딩 스레드 threads개가 대기열에서 최대 batch개씩 가져가고,
+    첫 요청 뒤 gather초 동안 더 모아서 묶음을 키움. 스레드 하나로 전부 묶으면 코어 1개만 써서, 스레드 여러 개가 나눠 맡음"""
+
+    def __init__(self, rec, threads=1, batch=12, gather=0.03):
+        self.rec, self.threads, self.batch, self.gather = rec, max(1, int(threads)), max(1, int(batch)), max(0.0, gather)
+        self.q = queue.Queue()
+        for i in range(self.threads):
+            threading.Thread(target=self._run, name=f'decode-{i}', daemon=True).start()
+
+    def decode(self, s):
+        if not self.rec.is_ready(s): return
+        job = [s, threading.Event(), None]
+        self.q.put(job); job[1].wait()
+        if job[2] is not None: raise job[2]
+
+    def _run(self):
+        while True:
+            jobs = [self.q.get()]
+            end = time.monotonic() + self.gather
+            while len(jobs) < self.batch:
+                left = end - time.monotonic()
+                try: jobs.append(self.q.get(timeout=left) if left > 0 else self.q.get_nowait())
+                except queue.Empty: break
+            try:
+                while True:
+                    ready = [j[0] for j in jobs if self.rec.is_ready(j[0])]
+                    if not ready: break
+                    self.rec.decode_streams(ready)
+            except Exception as e:   # 묶음 안의 회의 스레드들에 오류를 돌려줌 (그 회의만 닫힘)
+                for j in jobs: j[2] = e
+            finally:
+                for j in jobs: j[1].set()
+
+
 class Shared:
     """여러 회의가 같이 쓰는 모델: 메인 인식기, 화자 임베딩 추출기, 다른 인식 결과 작업.
     한 번만 올려 두고 회의마다 Engine(on_event, shared=…)로 상태만 새로 만듦.
@@ -206,7 +246,9 @@ class Shared:
 
     def __init__(self, model_dir=None, vad_model=None, chunk=DEFAULTS['chunk'], hotwords=DEFAULTS['hotwords'],
                  hotwords_score=DEFAULTS['hotwords_score'], spk_model=None, diar=True, alt=True, end_silence=0.8,
-                 max_len=DEFAULTS['max_len'], blank_penalty=DEFAULTS['blank_penalty']):
+                 max_len=DEFAULTS['max_len'], blank_penalty=DEFAULTS['blank_penalty'],
+                 batch=False, decode_threads=1, decode_batch=12, decode_gather=0.03):
+        """batch: 묶어서 디코딩 (BatchDecoder). 끄면 회의 스레드가 각자 decode_stream을 부름 (지금까지와 같은 결과)"""
         model_dir = model_dir or f'{DEFAULT_MODELS}/zipformer-174m'
         self.vad_model = vad_model or f'{DEFAULT_MODELS}/speaker/silero_vad.onnx'
         if not os.path.exists(self.vad_model):
@@ -216,6 +258,7 @@ class Shared:
         self.max_len, self.end_silence = max_len, end_silence   # 인식기 끊기 설정과 Engine의 강제 분할 판단이 같은 값을 써야 함
         self.ex = make_extractor(spk_model or f'{DEFAULT_MODELS}/speaker/nemo_en_titanet_small.onnx') if diar else None
         self.alt = AltWorker(model_dir) if alt else None
+        self.decoder = BatchDecoder(self.rec, decode_threads, decode_batch, decode_gather) if batch else None
 
 
 class Engine:
@@ -229,6 +272,7 @@ class Engine:
             shared = Shared(model_dir, vad_model, chunk, hotwords, hotwords_score, spk_model, diar, alt, end_silence, max_len, blank_penalty)
         self.shared = shared
         self.rec = shared.rec
+        self._decode = shared.decoder.decode if shared.decoder else self._decode_one
         self.max_len, self.overlap, self.end_silence = shared.max_len, overlap, shared.end_silence
         self.shift = 0.0     # 인식기 시각 - 실제 시각 (강제 분할 때 소리를 다시 넣은 만큼 앞섬)
         self.seg_len = 0.0   # 지금 줄을 시작한 뒤 인식기에 넣은 소리 길이 (강제 분할 판단용)
@@ -249,6 +293,9 @@ class Engine:
         self.vad_q = np.zeros(0, np.float32); self.cover = []; self.pending = []
         self.next_id = 0; self.cur_id = None; self.shown = ''
         self.restart = False   # 화면 지우기 때 서버가 켬: 다음 소리부터 새 줄로 시작 (지우기 전에 시작한 줄에 이어 붙어 버려지는 것을 막음)
+
+    def _decode_one(self, s):
+        while self.rec.is_ready(s): self.rec.decode_stream(s)
 
     def _new_id(self):
         self.next_id += 1
@@ -285,14 +332,14 @@ class Engine:
         s, rec = self.s, self.rec
         if self.restart:   # 말하던 줄은 버리고(지우기 전 내용) 인식기를 새로 시작
             self.restart = False
-            while rec.is_ready(s): rec.decode_stream(s)
+            self._decode(s)
             rec.reset(s); self.cur_id = None; self.shown = ''; self.seg_len = 0.0; self.dedup = None
             self.pending = [q for q in self.pending if q[1] > self.fed]
         s.accept_waveform(SR, c); self.fed += len(c) / SR; self.seg_len += len(c) / SR
         self.buf = np.concatenate([self.buf, c])
         if len(self.buf) > SR * self.keep:
             cut = len(self.buf) - SR * self.keep; self.buf = self.buf[cut:]; self.buf_t0 += cut / SR
-        while rec.is_ready(s): rec.decode_stream(s)
+        self._decode(s)
         raw = rec.get_result_all(s); r = self._trim(raw)
         cur = self._span(r); text = text_conf(r)[0]  # 확정 줄과 같게 띄어쓰기 포함
         if rec.is_endpoint(s):
@@ -308,7 +355,7 @@ class Engine:
             if forced and self.overlap > 0:   # 걸쳐 있던 단어를 새 줄에서 다시 듣게 함 (겹친 글자는 _trim이 뺌)
                 seg = self._audio(self.fed - self.overlap, self.fed)
                 s.accept_waveform(SR, seg); self.shift += len(seg) / SR; self.seg_len = len(seg) / SR
-                while rec.is_ready(s): rec.decode_stream(s)
+                self._decode(s)
         elif text and text != self.shown and cur:
             if self.cur_id is None: self.cur_id = self._new_id()
             self.shown = text
@@ -362,7 +409,7 @@ class Engine:
     def finish(self):
         s, rec = self.s, self.rec
         s.accept_waveform(SR, np.zeros(int(SR * 0.8), np.float32)); s.input_finished()
-        while rec.is_ready(s): rec.decode_stream(s)
+        self._decode(s)
         r = self._trim(rec.get_result_all(s)); cur = self._span(r)
         if r.text.strip() and cur: self._final(cur, r)
         elif self.cur_id is not None: self.on_event({'type': 'drop', 'id': self.cur_id})

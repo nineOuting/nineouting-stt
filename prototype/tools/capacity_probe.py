@@ -13,6 +13,7 @@ r"""이 컴퓨터(또는 파드)에서 동시 회의를 몇 개까지 실시간�
 실행 (prototype 기준. 파드 안에서는 /app 기준)
   python tools/capacity_probe.py --wav 녹음.wav
   python tools/capacity_probe.py --wav 녹음.wav --n 1,2,3,4,6 --sec 90
+  python tools/capacity_probe.py --wav 녹음.wav --n 20,24,28 --sec 90 --batch-decode   (묶어서 디코딩으로 띄움)
 
 녹음: 16kHz 모노 16비트 wav, 말소리가 있는 것 (잡음·무음이면 실제보다 가볍게 나옴). 길이는 --sec 이상 권장
   바꾸기: ffmpeg -i 원본 -ar 16000 -ac 1 -sample_fmt s16 녹음.wav
@@ -23,7 +24,7 @@ r"""이 컴퓨터(또는 파드)에서 동시 회의를 몇 개까지 실시간�
   - 회의 수 하나마다 --sec초 + 밀린 소리를 비우는 시간이 걸림 (기본 설정으로 약 10분)
   - 그동안 CPU를 파드 상한까지 쓸 수 있음
 """
-import argparse, json, os, platform, signal, subprocess, sys, tempfile, threading, time, urllib.request, wave
+import argparse, json, os, platform, random, signal, subprocess, sys, tempfile, threading, time, urllib.request, wave
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 p = argparse.ArgumentParser(description='동시 회의 실시간 처리 용량 측정 (숫자만 출력)')
@@ -33,6 +34,11 @@ p.add_argument('--n', default='1,2,3,4,6', help='동시 회의 수 (쉼표로 �
 p.add_argument('--port', type=int, default=18770, help='시험 서버의 음성 포트 (화면 포트는 이 값 - 5)')
 p.add_argument('--health', default='http://127.0.0.1:8770/health', help='실행 중인 STT의 상태 주소. 비우면 확인하지 않음')
 p.add_argument('--force', action='store_true', help='열린 회의가 있어도 돌림')
+p.add_argument('--batch-decode', action='store_true', help='시험 서버를 묶어서 디코딩으로 띄움 (server.py --batch-decode)')
+p.add_argument('--decode-threads', type=int, default=0, help='--batch-decode: 디코딩 스레드 수 (0이면 서버 기본: CPU 상한 - 1)')
+p.add_argument('--stagger', type=float, default=1.0,
+               help='회의마다 시작을 0~이 초 사이로 어긋나게 함 (기본 1). 실제 브라우저처럼 소리가 들어오는 시점을 흩뜨려 '
+                    '묶어서 디코딩이 실제보다 유리하게 나오지 않게 함. 0이면 모두 동시에 시작')
 A = p.parse_args()
 SR = 16000
 
@@ -102,10 +108,17 @@ def main():
         return pcm[start - start % 2:start - start % 2 + nb]
 
     ws_url, health = f'ws://127.0.0.1:{A.port}', f'http://127.0.0.1:{A.port}/health'
+
+    def decode_desc():
+        try: d = get(health).get('decode') or {}
+        except (OSError, ValueError): d = {}
+        if not d.get('batch'): return '회의마다 따로'
+        return f'묶어서 (스레드 {d.get("threads")}개, 최대 {d.get("maxBatch")}개, 모으는 시간 {d.get("gatherMs")}ms)'
     with tempfile.TemporaryDirectory(prefix='stt-probe-') as tmp:
         cmd = [sys.executable, os.path.join(ROOT, 'app', 'server.py'), '--input', 'ws', '--no-alt', '--no-diar', '--no-ticket',
                '--ws-host', '127.0.0.1', '--ws-port', str(A.port), '--port', str(A.port - 5), '--host', '127.0.0.1',
                '--max-meetings', str(max(ns) + 1), '--save-dir', tmp]
+        if A.batch_decode: cmd += ['--batch-decode', '--decode-threads', str(A.decode_threads)]
         env = dict(os.environ, BACKEND_URL='')   # 백엔드로 보내지 않음 (파일에만, 임시 폴더라 끝나면 지워짐)
         srv = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=open(os.path.join(tmp, 'server.log'), 'w'))
         try:
@@ -116,7 +129,8 @@ def main():
             else:
                 sys.exit('시험 서버가 120초 안에 뜨지 않음')
             print(f'환경: {platform.machine()} · CPU {os.cpu_count()}개 보임 · 컨테이너 CPU 상한 {cpu_limit() or "없음"} · '
-                  f'회의당 소리 {sec:.0f}초 · 시험 서버 메모리 {proc_rss_mib(srv.pid)}MiB (회의 없음)', flush=True)
+                  f'회의당 소리 {sec:.0f}초 · 시작 어긋남 0~{A.stagger:g}초 · 디코딩 {decode_desc()} · '
+                  f'시험 서버 메모리 {proc_rss_mib(srv.pid)}MiB (회의 없음)', flush=True)
             print('| 동시 회의 | 결과 | backlog 최대(초) | backlog 뒤 절반 평균(초) | backlog 끝(초) | 시험 서버 CPU 평균(코어) | 메모리(MiB) |', flush=True)
             print('|---|---|---|---|---|---|---|', flush=True)
             for n in ns:
@@ -125,6 +139,7 @@ def main():
                 def feed(i, mid):
                     try:
                         data = segment(i)
+                        time.sleep(random.Random(i).uniform(0, A.stagger))   # 회의마다 같은 값 (다시 재도 같게)
                         with connect(f'{ws_url}/ws/stt/meetings/{mid}') as c:
                             c.send(json.dumps({'type': 'start', 'meetingId': mid, 'offsetMs': 0})); c.recv(timeout=10)
                             t0 = time.perf_counter()
