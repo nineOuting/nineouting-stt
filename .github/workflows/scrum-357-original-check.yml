@@ -1,16 +1,16 @@
-# Unchanged control: same pinned source and checks in both arms.
-# Read-only existing Docker cache; no publishing, AWS authentication, GitOps or deployment.
-name: SCRUM-357 STT unchanged CI comparison
+# Original CI only: pinned original application source and original tests.
+# No registry publishing, AWS authentication, GitOps or deployment.
+name: SCRUM-357 original CI recheck
 'on':
   pull_request:
     branches:
     - develop
     paths:
-    - .github/workflows/scrum-357-controls.yml
+    - .github/workflows/scrum-357-original-check.yml
 permissions:
   contents: read
 jobs:
-  measure:
+  build:
     strategy:
       fail-fast: false
       matrix:
@@ -18,20 +18,9 @@ jobs:
         - platform: linux/amd64
           runner: ubuntu-latest
           pair: linux-amd64
-          variant: before
         - platform: linux/arm64
           runner: ubuntu-24.04-arm
           pair: linux-arm64
-          variant: before
-        - platform: linux/amd64
-          runner: ubuntu-latest
-          pair: linux-amd64
-          variant: after
-        - platform: linux/arm64
-          runner: ubuntu-24.04-arm
-          pair: linux-arm64
-          variant: after
-      max-parallel: 2
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -72,7 +61,7 @@ jobs:
         \n"
     - name: "\uBC30\uD3EC \uC5F0\uACB0 \uC720\uC9C0 \uAC80\uC99D"
       run: docker run --rm --network none "$REF" python -m unittest discover -s tools -p 'test_drain*.py'
-    - name: Remove measurement image
+    - name: Remove recheck image
       if: always()
       run: docker image rm nineouting-verified:local || true
     timeout-minutes: 30
