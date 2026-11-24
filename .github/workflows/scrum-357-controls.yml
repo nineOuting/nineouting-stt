@@ -1,0 +1,78 @@
+# Unchanged control: same pinned source and checks in both arms.
+# Read-only existing Docker cache; no publishing, AWS authentication, GitOps or deployment.
+name: SCRUM-357 STT unchanged CI comparison
+'on':
+  pull_request:
+    branches:
+    - develop
+    paths:
+    - .github/workflows/scrum-357-controls.yml
+permissions:
+  contents: read
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - platform: linux/amd64
+          runner: ubuntu-latest
+          pair: linux-amd64
+          variant: before
+        - platform: linux/arm64
+          runner: ubuntu-24.04-arm
+          pair: linux-arm64
+          variant: before
+        - platform: linux/amd64
+          runner: ubuntu-latest
+          pair: linux-amd64
+          variant: after
+        - platform: linux/arm64
+          runner: ubuntu-24.04-arm
+          pair: linux-arm64
+          variant: after
+      max-parallel: 2
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: 54456d026fc3a6184d16b26a8d002c99c35c6709
+        persist-credentials: false
+    - name: "\uAC8C\uC2DC \uAC80\uC99D \uD68C\uADC0 \uC2DC\uD5D8 (\uC2E4\uC81C Docker \uD3EC\uD568)"
+      run: python3 .github/scripts/test_publish_dev_ecr.py
+      env:
+        PUBLISH_REAL_DOCKER: '1'
+    - name: "\uBAA8\uB378 \uB2E4\uC6B4\uB85C\uB4DC \uC7AC\uC2DC\uB3C4 \uB2E8\uC704 \uAC80\uC99D"
+      run: python3 -m unittest discover -s prototype/tools -p test_download_models.py
+    - uses: docker/setup-buildx-action@v3
+    - name: Build local image
+      uses: docker/build-push-action@v6
+      with:
+        context: prototype
+        platforms: ${{ matrix.platform }}
+        load: true
+        tags: nineouting-verified:local
+        cache-from: type=gha,scope=${{ matrix.pair }}
+        push: false
+    - name: "\uD655\uC778\uD560 \uC774\uBBF8\uC9C0"
+      run: echo "REF=nineouting-verified:local" >> "$GITHUB_ENV"
+    - name: "\uC774\uBBF8\uC9C0 \uD06C\uAE30"
+      run: "size=$(docker image inspect \"$REF\" --format '{{.Size}}')\necho \"${{ matrix.platform }} \uC774\uBBF8\uC9C0 \uD06C\
+        \uAE30(\uC555\uCD95 \uD480\uB9B0 \uC0C1\uD0DC): $((size / 1000000)) MB (${size} bytes)\" | tee -a \"$GITHUB_STEP_SUMMARY\"\
+        \n"
+    - name: "\uBAA8\uB378 \uD655\uC778"
+      run: "docker run --rm --network none -e PYTHONPATH=/app/app \"$REF\" python -c \"\nimport os, platform\nfrom engine\
+        \ import make_rec, DEFAULT_MODELS\nrec = make_rec(DEFAULT_MODELS + '/zipformer-174m', '64', 'modified_beam_search',\n\
+        \               hotwords='/app/app/hotwords.txt')\nrec.create_stream()\nassert os.path.exists(DEFAULT_MODELS + '/speaker/silero_vad.onnx'),\
+        \ 'VAD \uBAA8\uB378 \uC5C6\uC74C'\nopen('/app/transcripts/.write-check', 'w').close()   # \uC2E4\uD589 \uC0AC\uC6A9\
+        \uC790\uAC00 \uC804\uC0AC \uD3F4\uB354\uC5D0 \uC4F8 \uC218 \uC788\uB294\uC9C0\nprint('\uBAA8\uB378 \uD655\uC778 uid=%d\
+        \ arch=%s \uC804\uC0AC \uD3F4\uB354 \uC4F0\uAE30 \uB428' % (os.getuid(), platform.machine()))\n\" | tee -a \"$GITHUB_STEP_SUMMARY\"\
+        \n"
+    - name: "\uBC30\uD3EC \uC5F0\uACB0 \uC720\uC9C0 \uAC80\uC99D"
+      run: docker run --rm --network none "$REF" python -m unittest discover -s tools -p 'test_drain*.py'
+    - name: Remove measurement image
+      if: always()
+      run: docker image rm nineouting-verified:local || true
+    timeout-minutes: 30
