@@ -87,10 +87,10 @@ p.add_argument('--backend-url', default=os.environ.get('BACKEND_URL', ''),
                help='백엔드 주소 (.env BACKEND_URL, 예: http://meeting-service:8083). 없으면 backend.jsonl 파일에만 기록')
 p.add_argument('--backend-period', type=float, default=0.5, help='백엔드 전송 주기(초). 그사이 바뀐 줄만 보냄')
 p.add_argument('--meeting-id', default='', help='첫 회의의 회의 번호 (백엔드가 쓰는 숫자). 없으면 자동 이름을 붙이고 백엔드로는 보내지 않음')
-p.add_argument('--max-meetings', type=int, default=int(os.environ.get('MAX_MEETINGS') or 4),
+p.add_argument('--max-meetings', type=int, default=int(os.environ.get('MAX_MEETINGS') or 15),
                help='--input ws: 동시에 여는 회의 수 상한 (.env MAX_MEETINGS). 다 차면 새 회의는 1013으로 닫음 (/ready는 그대로 200). '
                     '0이면 상한 없음 (시험용: CPU가 모자라면 모든 회의의 자막이 같이 늦어짐). '
-                    '기본 4: DEV 파드의 보장 CPU 0.5코어로 버티는 수 (회의당 약 0.1코어, 2026-11-18 DEV 측정)')
+                    '기본 15')
 p.add_argument('--backlog-warn', type=float, default=float(os.environ.get('BACKLOG_WARN_SEC') or 5),
                help='--input ws: 회의의 밀린 소리가 이 초를 넘으면 로그에 남김 (.env BACKLOG_WARN_SEC, 0이면 끔). 1초 밑으로 내려오면 풀림도 남김')
 p.add_argument('--idle-release', type=float, default=float(os.environ.get('MEETING_IDLE_SEC') or 600),
