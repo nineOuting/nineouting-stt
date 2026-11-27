@@ -149,10 +149,65 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           DEV_GITOPS_TOKEN: ${{ secrets.DEV_GITOPS_TOKEN }}
+  # 버전 릴리스 (2026-11-27). DEV 이미지마다 <다음 정식 버전>-dev.<순번> 사전 릴리스, ECR 이미지에도 같은 태그
+  dev-release:
+    name: DEV 버전 릴리스
+    needs: dev-ecr
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ap-northeast-2
+      TARGET_IMAGE: 443845329525.dkr.ecr.ap-northeast-2.amazonaws.com/nineouting-dev-stt
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: dev-ecr-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verified-image
+      - name: Authenticate to DEV with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::443845329525:role/nineouting-dev-stt-github
+          aws-region: ap-northeast-2
+          role-session-name: gha-release-${{ github.run_id }}
+      - name: 버전 태그와 사전 릴리스
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/release.sh dev
+  # main 머지마다 정식 버전 (v1.0.0부터 패치 번호 +1). 운영 서버 준비 전이라 이미지는 만들지 않는다
+  release:
+    name: 정식 버전 릴리스
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 정식 릴리스
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/release.sh main
 'on':
   push:
     branches:
       - develop
+      - main
     tags:
       - v[0-9]+.[0-9]+.[0-9]+
     paths:
