@@ -17,6 +17,43 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Trivy Dockerfile 보안 설정 검사
+        if: matrix.platform == 'linux/amd64'
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_CONFIG: /dev/null
+          TRIVY_IGNOREFILE: /dev/null
+          TRIVY_SECRET_CONFIG: /dev/null
+        with:
+          version: v0.76.2
+          scan-type: config
+          scan-ref: prototype/Dockerfile
+          format: json
+          output: trivy-config-report.json
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: '0'
+      - name: Trivy 설정 차단 기준 확인
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          data = json.loads(Path('trivy-config-report.json').read_text())
+          findings = [m for r in (data.get('Results') or []) for m in (r.get('Misconfigurations') or [])]
+          counts = {level: sum(m.get('Severity') == level for m in findings) for level in ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN')}
+          print('Trivy config findings: ' + ', '.join(f'{k}={v}' for k, v in counts.items()))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('### Trivy Dockerfile/config scan\n\n' + '\n'.join(f'- {k}: {v}' for k, v in counts.items()) + '\n')
+          sys.exit(1 if counts['CRITICAL'] or counts['HIGH'] else 0)
+          PY
+      - name: 보안 검사 결과 보관 - Dockerfile/config
+        if: always() && matrix.platform == 'linux/amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-config-report
+          path: trivy-config-report.json
+          if-no-files-found: warn
+          retention-days: 30
       - name: 게시 검증 회귀 시험 (실제 Docker 포함)
         run: python3 .github/scripts/test_publish_dev_ecr.py
         env:
@@ -25,6 +62,7 @@ jobs:
         run: python3 -m unittest discover -s prototype/tools -p test_download_models.py
       - uses: docker/setup-buildx-action@v3
       - name: Build local image
+        id: build_local_image
         uses: docker/build-push-action@v6
         with:
           context: prototype
@@ -53,6 +91,81 @@ jobs:
           " | tee -a "$GITHUB_STEP_SUMMARY"
       - name: 배포 연결 유지 검증
         run: docker run --rm --network none "$REF" python -m unittest discover -s tools -p 'test_drain*.py'
+      - name: Trivy 이미지 취약점 전체 결과
+        if: always() && steps.build_local_image.outcome == 'success'
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_CONFIG: /dev/null
+          TRIVY_IGNOREFILE: /dev/null
+          TRIVY_SECRET_CONFIG: /dev/null
+        with:
+          version: v0.76.2
+          image-ref: nineouting-verified:local
+          scanners: vuln
+          vuln-type: os,library
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          format: json
+          output: trivy-image-vuln.json
+          exit-code: '0'
+      - name: Trivy 이미지 취약점 차단 기준 확인
+        if: always() && steps.build_local_image.outcome == 'success'
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          data = json.loads(Path('trivy-image-vuln.json').read_text())
+          findings = [v for r in (data.get('Results') or []) for v in (r.get('Vulnerabilities') or [])]
+          counts = {level: sum(v.get('Severity') == level for v in findings) for level in ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN')}
+          print('Trivy image vulnerabilities: ' + ', '.join(f'{k}={v}' for k, v in counts.items()))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('### Trivy image vulnerability scan\n\n' + '\n'.join(f'- {k}: {v}' for k, v in counts.items()) + '\n')
+          sys.exit(1 if counts['CRITICAL'] or counts['HIGH'] else 0)
+          PY
+      - name: Trivy 이미지 비밀정보 검사
+        if: always() && steps.build_local_image.outcome == 'success'
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_CONFIG: /dev/null
+          TRIVY_IGNOREFILE: /dev/null
+          TRIVY_SECRET_CONFIG: /dev/null
+        with:
+          version: v0.76.2
+          skip-setup-trivy: true
+          image-ref: nineouting-verified:local
+          scanners: secret
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          format: json
+          output: trivy-secret-raw.json
+          exit-code: '0'
+      - name: 비밀정보 검사 결과 요약 및 차단
+        if: always() && steps.build_local_image.outcome == 'success'
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          raw = Path('trivy-secret-raw.json')
+          data = json.loads(raw.read_text())
+          findings = [
+              {'target': r.get('Target', ''), 'rule_id': s.get('RuleID', ''), 'category': s.get('Category', ''), 'severity': s.get('Severity', '')}
+              for r in (data.get('Results') or []) for s in (r.get('Secrets') or [])
+          ]
+          Path('trivy-secret-summary.json').write_text(json.dumps({'finding_count': len(findings), 'findings': findings}, indent=2) + '\n')
+          raw.unlink(missing_ok=True)
+          print(f"Trivy image secret findings: {len(findings)} (secret values omitted)")
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(f"### Trivy image secret scan\n\n- Findings: {len(findings)}\n- Secret values: omitted\n")
+          sys.exit(1 if findings else 0)
+          PY
+      - name: Trivy 검사 결과 보관
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-report-${{ matrix.pair }}
+          path: |
+            trivy-image-vuln.json
+            trivy-secret-summary.json
+          if-no-files-found: warn
+          retention-days: 30
       - name: Save exact built image
         if: matrix.platform == 'linux/amd64' && (github.event_name == 'push' && github.ref == 'refs/heads/develop')
         run: docker save nineouting-verified:local | gzip > verified-image.tar.gz
