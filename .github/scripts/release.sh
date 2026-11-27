@@ -75,17 +75,20 @@ fi
 # DEV ECR 이미지에 버전 태그를 더한다. 같은 태그가 이미 그 이미지에 있으면 넘어간다 (태그는 IMMUTABLE)
 if [[ "$mode" == dev ]]; then
   name=${repository#*/}
-  if aws ecr describe-images --repository-name "$name" --image-ids imageTag="$version" \
-      --query 'imageDetails[0].imageDigest' --output text 2>/dev/null | grep -qx "$digest"; then
+  manifest=$(aws ecr batch-get-image --repository-name "$name" --image-ids imageDigest="$digest" \
+    --query 'images[0].imageManifest' --output text)
+  media_type=$(aws ecr batch-get-image --repository-name "$name" --image-ids imageDigest="$digest" \
+    --query 'images[0].imageManifestMediaType' --output text)
+  # 다시 실행하면 같은 이미지에 같은 태그가 이미 있다 (ImageAlreadyExists, 성공으로 본다).
+  # 다른 이미지에 같은 태그가 있으면(ImageTagAlreadyExists) 실패한다. 배포 역할에 DescribeImages가 없어 미리 묻지 않는다
+  if put_error=$(aws ecr put-image --repository-name "$name" --image-tag "$version" \
+      --image-manifest "$manifest" --image-manifest-media-type "$media_type" 2>&1 > /dev/null); then
+    echo "ECR tagged $repository:$version -> $digest"
+  elif [[ "$put_error" == *ImageAlreadyExistsException* ]]; then
     echo "ECR already tagged $version"
   else
-    manifest=$(aws ecr batch-get-image --repository-name "$name" --image-ids imageDigest="$digest" \
-      --query 'images[0].imageManifest' --output text)
-    media_type=$(aws ecr batch-get-image --repository-name "$name" --image-ids imageDigest="$digest" \
-      --query 'images[0].imageManifestMediaType' --output text)
-    aws ecr put-image --repository-name "$name" --image-tag "$version" \
-      --image-manifest "$manifest" --image-manifest-media-type "$media_type" > /dev/null
-    echo "ECR tagged $repository:$version -> $digest"
+    echo "$put_error" >&2
+    exit 1
   fi
   {
     echo "### $version"
